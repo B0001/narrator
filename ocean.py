@@ -10,7 +10,7 @@ prompt and sampling options for a local Ollama model.
 import json
 import sys
 import urllib.request
-from dataclasses import astuple, dataclass
+from dataclasses import asdict, astuple, dataclass
 
 TRAITS = ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")
 
@@ -40,6 +40,36 @@ class Ocean:
             v = getattr(self, t)
             if not -1.0 <= v <= 1.0:
                 raise ValueError(f"{t}={v} outside [-1.0, 1.0]")
+
+    def save(self, path):
+        """Write the profile as JSON so it can be shared and diffed."""
+        with open(path, "w") as f:
+            json.dump(asdict(self), f, indent=2, sort_keys=True)
+            f.write("\n")
+
+    @classmethod
+    def load(cls, path):
+        """Read a profile, rejecting anything that is not all five traits in range.
+
+        ponytail: the dataclass is the schema. A JSON Schema file to describe
+        five floats would be a second copy of these rules to keep in sync.
+        """
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: expected a JSON object, got {type(data).__name__}")
+        if unknown := sorted(set(data) - set(TRAITS)):
+            raise ValueError(f"{path}: unknown traits {unknown}; expected {list(TRAITS)}")
+        if missing := sorted(set(TRAITS) - set(data)):
+            raise ValueError(f"{path}: missing traits {missing}")
+        for t in TRAITS:
+            # bool is an int subclass, and True as a trait value is a mistake worth naming.
+            if isinstance(data[t], bool) or not isinstance(data[t], (int, float)):
+                raise ValueError(f"{path}: {t} must be a number, got {data[t]!r}")
+        try:
+            return cls(**data)
+        except ValueError as e:
+            raise ValueError(f"{path}: {e}") from e
 
     def transform(self, matrix):
         """Re-weight traits through a 5x5 matrix, e.g. a cultural adjustment.
@@ -126,12 +156,44 @@ def _self_check():
         else:
             raise AssertionError(f"openness={bad} should have been rejected")
 
+    _check_profile_io()
     print("ok")
+
+
+def _check_profile_io():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/p.json"
+        original = Ocean(0.3, -0.7, 0.0, 0.95, -0.25)
+        original.save(path)
+        assert Ocean.load(path) == original, "save/load must round-trip exactly"
+
+        rejects = {
+            "not an object": "[1, 2, 3]",
+            "unknown trait": '{"openness": 0, "conscientiousness": 0, "extraversion": 0, "agreeableness": 0, "neuroticism": 0, "charisma": 1}',
+            "missing trait": '{"openness": 0.5}',
+            "out of range": '{"openness": 4.0, "conscientiousness": 0, "extraversion": 0, "agreeableness": 0, "neuroticism": 0}',
+            "wrong type": '{"openness": "high", "conscientiousness": 0, "extraversion": 0, "agreeableness": 0, "neuroticism": 0}',
+            "bool sneaking in": '{"openness": true, "conscientiousness": 0, "extraversion": 0, "agreeableness": 0, "neuroticism": 0}',
+        }
+        for label, blob in rejects.items():
+            with open(path, "w") as f:
+                f.write(blob)
+            try:
+                Ocean.load(path)
+            except ValueError as e:
+                assert path in str(e), f"{label}: error must name the file, got {e}"
+            else:
+                raise AssertionError(f"{label} should have been rejected")
 
 
 if __name__ == "__main__":
     if "--demo" in sys.argv:
-        profile = Ocean(neuroticism=0.9, conscientiousness=-0.6, agreeableness=-0.4)
+        if "--profile" in sys.argv:
+            profile = Ocean.load(sys.argv[sys.argv.index("--profile") + 1])
+        else:
+            profile = Ocean(neuroticism=0.9, conscientiousness=-0.6, agreeableness=-0.4)
         print(generate(profile, sys.argv[sys.argv.index("--demo") + 1]))
     else:
         _self_check()
