@@ -88,6 +88,43 @@ def describe(g, path):
     return "\n".join(f"{i}. {n} — {g.nodes[n]['desc']}" for i, n in enumerate(path, 1))
 
 
+def to_mermaid(g, path=None):
+    """Render the graph as Mermaid, with `path` drawn as a thick line.
+
+    ponytail: Mermaid over matplotlib/graphviz — GitHub renders it inline, so
+    the picture costs zero dependencies. Swap in a real plot if you need PNGs.
+    """
+    walked = set(zip(path, path[1:])) if path else set()
+    on_path = set(path or ())
+    lines = ["flowchart TD"]
+    for n, d in g.nodes(data=True):
+        lines.append(f'    {n}["{n.replace("_", " ")}"]:::{"walked" if n in on_path else d["kind"]}')
+    for a, b, d in g.edges(data=True):
+        lines.append(f"    {a} {'==>' if (a, b) in walked else '-->'}|{d['weight']}| {b}")
+    lines += [
+        "    classDef trigger fill:#fde68a,stroke:#b45309,color:#000",
+        "    classDef bias fill:#e5e7eb,stroke:#6b7280,color:#000",
+        "    classDef terminal fill:#fecaca,stroke:#b91c1c,color:#000",
+        "    classDef walked fill:#bfdbfe,stroke:#1d4ed8,stroke-width:3px,color:#000",
+    ]
+    return "\n".join(lines)
+
+
+def prose(g, path, model="llama3"):
+    """Turn the path into story beats, one per state, in order."""
+    from ocean import Ocean, generate
+
+    states = "\n".join(f"{i}. {n.replace('_', ' ')}: {g.nodes[n]['desc']}" for i, n in enumerate(path, 1))
+    prompt = (
+        "Below is a murderer's psychological deterioration, one state per line, in order.\n"
+        f"{states}\n\n"
+        f"Write exactly {len(path)} numbered story beats, one per state, in the same order. "
+        "Each beat is two or three sentences of a mystery novel outline showing that state in "
+        "action. Keep the same character throughout. Do not name the psychological state; show it."
+    )
+    return generate(Ocean(openness=0.5, conscientiousness=0.6), prompt, model=model)
+
+
 def _self_check():
     import tempfile
 
@@ -121,6 +158,7 @@ def _self_check():
                 raise AssertionError(f"{label} should have been rejected")
 
     _check_traversal(g)
+    _check_render(g)
     print(f"ok — {g.number_of_nodes()} nodes, {g.number_of_edges()} edges")
     for kind in KINDS:
         print(f"  {kind}: {', '.join(nodes_of_kind(g, kind))}")
@@ -149,10 +187,25 @@ def _check_traversal(g):
         raise AssertionError("unknown start node should have been rejected")
 
 
+def _check_render(g):
+    path = deterioration_path(g, seed=42)
+    m = to_mermaid(g, path)
+    assert m.startswith("flowchart TD")
+    assert all(n in m for n in g), "every node must appear in the diagram"
+    assert m.count("==>") == len(path) - 1, "walked edges must be the thick ones"
+    assert "classDef walked" in m
+    assert to_mermaid(g).count("==>") == 0, "no path means no highlighting"
+
+
 if __name__ == "__main__":
     if "--seed" in sys.argv:
         graph = load_graph()
-        seed = int(sys.argv[sys.argv.index("--seed") + 1])
-        print(describe(graph, deterioration_path(graph, seed=seed)))
+        walk = deterioration_path(graph, seed=int(sys.argv[sys.argv.index("--seed") + 1]))
+        if "--mermaid" in sys.argv:
+            print(to_mermaid(graph, walk))
+        elif "--prose" in sys.argv:
+            print(prose(graph, walk))
+        else:
+            print(describe(graph, walk))
     else:
         _self_check()
