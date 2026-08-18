@@ -7,6 +7,8 @@ trigger to a terminal is the murderer's deterioration path (C2).
 """
 
 import json
+import random
+import sys
 
 import networkx as nx
 
@@ -53,6 +55,39 @@ def nodes_of_kind(g, kind):
     return sorted(n for n, d in g.nodes(data=True) if d["kind"] == kind)
 
 
+def deterioration_path(g, seed=None, start=None):
+    """Walk trigger -> terminal, picking each step weighted by escalation strength.
+
+    Same seed, same path. States are never revisited: a motive that loops back
+    through a bias it already passed reads as repetition rather than descent.
+    """
+    rng = random.Random(seed)
+    terminals = nodes_of_kind(g, "terminal")
+    node = start if start is not None else rng.choice(nodes_of_kind(g, "trigger"))
+    if node not in g:
+        raise ValueError(f"unknown start node {node!r}")
+
+    path, seen = [node], {node}
+    while g.nodes[node]["kind"] != "terminal":
+        options = [n for n in g.successors(node) if n not in seen]
+        if not options:
+            # Walked into a corner. Finish along the shortest remaining route so
+            # the path still lands on an ending rather than trailing off.
+            routes = [nx.shortest_path(g, node, t) for t in terminals if nx.has_path(g, node, t)]
+            if not routes:
+                raise ValueError(f"no route from {node!r} to a terminal")
+            path += min(routes, key=len)[1:]
+            break
+        node = rng.choices(options, weights=[g[path[-1]][n]["weight"] for n in options])[0]
+        path.append(node)
+        seen.add(node)
+    return path
+
+
+def describe(g, path):
+    return "\n".join(f"{i}. {n} — {g.nodes[n]['desc']}" for i, n in enumerate(path, 1))
+
+
 def _self_check():
     import tempfile
 
@@ -85,10 +120,39 @@ def _self_check():
             else:
                 raise AssertionError(f"{label} should have been rejected")
 
+    _check_traversal(g)
     print(f"ok — {g.number_of_nodes()} nodes, {g.number_of_edges()} edges")
     for kind in KINDS:
         print(f"  {kind}: {', '.join(nodes_of_kind(g, kind))}")
 
 
+def _check_traversal(g):
+    triggers, terminals = nodes_of_kind(g, "trigger"), nodes_of_kind(g, "terminal")
+
+    assert deterioration_path(g, seed=7) == deterioration_path(g, seed=7), "same seed must reproduce the path"
+    paths = [deterioration_path(g, seed=s) for s in range(40)]
+    assert len({tuple(p) for p in paths}) > 1, "different seeds must not all collapse to one path"
+
+    for p in paths:
+        assert p[0] in triggers, f"path must start at a trigger, got {p[0]}"
+        assert p[-1] in terminals, f"path must end at a terminal, got {p[-1]}"
+        assert len(set(p)) == len(p), f"path revisits a state: {p}"
+        for a, b in zip(p, p[1:]):
+            assert g.has_edge(a, b), f"path uses non-existent edge {a}->{b}"
+
+    assert deterioration_path(g, seed=1, start="exposure_threat")[0] == "exposure_threat"
+    try:
+        deterioration_path(g, seed=1, start="nonexistent")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown start node should have been rejected")
+
+
 if __name__ == "__main__":
-    _self_check()
+    if "--seed" in sys.argv:
+        graph = load_graph()
+        seed = int(sys.argv[sys.argv.index("--seed") + 1])
+        print(describe(graph, deterioration_path(graph, seed=seed)))
+    else:
+        _self_check()
