@@ -7,3 +7,5 @@
 
 # Scratch transcripts from ad-hoc runs (scenario samples are committed by name)
 transcript.jsonl
+__pycache__/
+*.pyc
