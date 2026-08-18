@@ -1,0 +1,60 @@
+{
+  "_comment": "Motive vocabulary for C2. Nodes are psychological states, not places. kind=trigger starts a path, kind=bias escalates it, kind=terminal ends it. Edge weight is how readily one state escalates into the next (0-1]; these are authored story-plausibility weights, not empirical transition rates. Edit freely -- this file is the substance of the generator.",
+  "nodes": [
+    {"id": "public_humiliation", "kind": "trigger", "desc": "Shamed in front of people whose regard they depend on"},
+    {"id": "betrayal_by_intimate", "kind": "trigger", "desc": "A partner, sibling, or close friend broke trust"},
+    {"id": "financial_ruin", "kind": "trigger", "desc": "Sudden loss of money or livelihood, with someone to blame"},
+    {"id": "thwarted_ambition", "kind": "trigger", "desc": "Passed over for the thing their identity was staked on"},
+    {"id": "exposure_threat", "kind": "trigger", "desc": "A secret is about to surface and someone can reveal it"},
+
+    {"id": "rumination", "kind": "bias", "desc": "Cannot stop replaying the grievance; it grows on each pass"},
+    {"id": "hostile_attribution", "kind": "bias", "desc": "Reads ambiguous acts as deliberate malice"},
+    {"id": "confirmation_bias", "kind": "bias", "desc": "Collects only the evidence that indicts the target"},
+    {"id": "catastrophizing", "kind": "bias", "desc": "Inflates the stakes until this feels like survival"},
+    {"id": "self_serving_bias", "kind": "bias", "desc": "Takes credit for good outcomes, assigns blame outward"},
+    {"id": "just_world_reasoning", "kind": "bias", "desc": "Concludes the target brought it on themselves"},
+    {"id": "moral_licensing", "kind": "bias", "desc": "Past good conduct is felt to purchase this exception"},
+    {"id": "dehumanization", "kind": "bias", "desc": "Target becomes an obstacle rather than a person"},
+    {"id": "sunk_cost", "kind": "bias", "desc": "Too much already spent on the grievance to stop now"},
+    {"id": "illusory_superiority", "kind": "bias", "desc": "Certain they are cleverer than anyone investigating"},
+    {"id": "diffusion_of_responsibility", "kind": "bias", "desc": "Anyone in their position would have done it"},
+
+    {"id": "rationalized_intent", "kind": "terminal", "desc": "The act is now justified to themselves; only means remain"},
+    {"id": "opportunity_seized", "kind": "terminal", "desc": "Means and moment arrive and are taken"}
+  ],
+  "edges": [
+    {"from": "public_humiliation", "to": "rumination", "weight": 0.9, "note": "Shame is the most replayed injury"},
+    {"from": "public_humiliation", "to": "hostile_attribution", "weight": 0.6},
+    {"from": "betrayal_by_intimate", "to": "rumination", "weight": 0.8},
+    {"from": "betrayal_by_intimate", "to": "hostile_attribution", "weight": 0.7},
+    {"from": "financial_ruin", "to": "catastrophizing", "weight": 0.8},
+    {"from": "financial_ruin", "to": "self_serving_bias", "weight": 0.5},
+    {"from": "thwarted_ambition", "to": "self_serving_bias", "weight": 0.8, "note": "The failure must belong to someone else"},
+    {"from": "thwarted_ambition", "to": "rumination", "weight": 0.6},
+    {"from": "exposure_threat", "to": "catastrophizing", "weight": 0.9},
+
+    {"from": "rumination", "to": "confirmation_bias", "weight": 0.8},
+    {"from": "rumination", "to": "hostile_attribution", "weight": 0.7},
+    {"from": "rumination", "to": "sunk_cost", "weight": 0.4},
+    {"from": "hostile_attribution", "to": "just_world_reasoning", "weight": 0.6},
+    {"from": "hostile_attribution", "to": "dehumanization", "weight": 0.5},
+    {"from": "confirmation_bias", "to": "just_world_reasoning", "weight": 0.7},
+    {"from": "confirmation_bias", "to": "hostile_attribution", "weight": 0.5},
+    {"from": "catastrophizing", "to": "moral_licensing", "weight": 0.5},
+    {"from": "catastrophizing", "to": "sunk_cost", "weight": 0.6},
+    {"from": "catastrophizing", "to": "diffusion_of_responsibility", "weight": 0.4},
+    {"from": "self_serving_bias", "to": "just_world_reasoning", "weight": 0.7},
+    {"from": "self_serving_bias", "to": "illusory_superiority", "weight": 0.5},
+    {"from": "just_world_reasoning", "to": "dehumanization", "weight": 0.7, "note": "Deserving it is one step from not counting"},
+    {"from": "just_world_reasoning", "to": "moral_licensing", "weight": 0.6},
+    {"from": "moral_licensing", "to": "rationalized_intent", "weight": 0.8},
+    {"from": "dehumanization", "to": "rationalized_intent", "weight": 0.9},
+    {"from": "sunk_cost", "to": "rationalized_intent", "weight": 0.6},
+    {"from": "diffusion_of_responsibility", "to": "rationalized_intent", "weight": 0.6},
+    {"from": "illusory_superiority", "to": "rationalized_intent", "weight": 0.5},
+
+    {"from": "rationalized_intent", "to": "illusory_superiority", "weight": 0.4, "note": "Justification breeds confidence in getting away with it"},
+    {"from": "rationalized_intent", "to": "opportunity_seized", "weight": 0.9},
+    {"from": "illusory_superiority", "to": "opportunity_seized", "weight": 0.6}
+  ]
+}
