@@ -67,6 +67,14 @@ def load_transcript(path="transcript.jsonl"):
 CONTRARIAN = Agent("Vale", Ocean(agreeableness=-0.8, extraversion=0.7, conscientiousness=0.3))
 ACCOMMODATING = Agent("Wren", Ocean(agreeableness=0.9, extraversion=-0.2, neuroticism=0.4))
 
+# A split forces both agents to name a number, which is what makes the trait
+# difference legible: you can read the concession pattern straight off the log.
+SCARCE_RESOURCE = (
+    "You and one other person must divide 10 doses of a medicine that you both need. "
+    "It cannot be shared or split further than whole doses. Every reply must state the "
+    "exact split you are proposing, as two numbers, and one sentence of why."
+)
+
 
 def _self_check():
     import tempfile
@@ -106,11 +114,17 @@ def _self_check():
     print("ok")
 
 
+def run_scenario(topic=SCARCE_RESOURCE, turns=6, path="transcript.jsonl"):
+    for record in converse([CONTRARIAN, ACCOMMODATING], topic, turns=turns, path=path):
+        traits = record["profile"]
+        print(f"[{record['turn']}] {record['speaker']} (A={traits['agreeableness']:+.1f}): {record['text']}\n")
+    print(f"{path} written")
+
+
 if __name__ == "__main__":
-    if "--run" in sys.argv:
-        topic = sys.argv[sys.argv.index("--run") + 1]
-        for record in converse([CONTRARIAN, ACCOMMODATING], topic, turns=4):
-            print(f"[{record['turn']}] {record['speaker']}: {record['text']}\n")
-        print("transcript.jsonl written")
+    if "--scenario" in sys.argv:
+        run_scenario(path="scarce_resource.jsonl")
+    elif "--run" in sys.argv:
+        run_scenario(topic=sys.argv[sys.argv.index("--run") + 1], turns=4)
     else:
         _self_check()
