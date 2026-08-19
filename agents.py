@@ -59,8 +59,24 @@ def converse(agents, topic, turns=6, path="transcript.jsonl", model="llama3", ge
 
 
 def load_transcript(path="transcript.jsonl"):
+    """Read a transcript back, naming the file and line if one will not parse.
+
+    converse() flushes one object per line, so a run killed mid-write really
+    does leave a truncated last line. A bare JSONDecodeError says "line 1
+    column 41" of a string it does not show you; the file and line number are
+    what make it findable. ValueError is kept as the type, which JSONDecodeError
+    already is, so existing handlers are unaffected.
+    """
+    out = []
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{lineno}: {e}") from e
+    return out
 
 
 # The PRD's reference pairing: blunt and contrarian against warm and yielding.
@@ -111,7 +127,31 @@ def _self_check():
         else:
             raise AssertionError("empty agent list should have been rejected")
 
+        _check_truncated_transcript(f"{d}/broken.jsonl")
+
     print("ok")
+
+
+def _check_truncated_transcript(path):
+    """A run killed mid-write leaves a half-object on the last line. That line
+    number is the whole point of the error, so assert on it, not just the type."""
+    good = json.dumps({"turn": 0, "speaker": "Vale", "profile": {}, "text": "8-2"})
+    with open(path, "w") as f:
+        f.write(good + "\n\n" + good + "\n" + '{"turn": 2, "speaker": "Wr')
+
+    try:
+        load_transcript(path)
+    except ValueError as e:
+        # Blank line 2 is skipped and does not shift the count: the half-written
+        # object really is on line 4.
+        assert f"{path}:4:" in str(e), f"error must name the file and line, got {e}"
+    else:
+        raise AssertionError("a truncated final line should have been rejected")
+
+    # A blank trailing line is normal, not corruption.
+    with open(path, "w") as f:
+        f.write(good + "\n\n")
+    assert len(load_transcript(path)) == 1, "blank lines are skipped, not parsed"
 
 
 def run_scenario(topic=SCARCE_RESOURCE, turns=6, path="transcript.jsonl"):
