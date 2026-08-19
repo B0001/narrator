@@ -90,12 +90,101 @@ class WorldSimulation:
         )
 
 
+def can_reach(spatial, origin, destination, steps):
+    """Could someone standing in `origin` be in `destination` `steps` later?
+
+    Loitering is allowed, so only the shortest path matters, not its parity.
+    """
+    if steps < 0:
+        return False
+    try:
+        return nx.shortest_path_length(spatial.graph, origin, destination) <= steps
+    except nx.NetworkXNoPath:
+        return False
+
+
+class AlibiEngine:
+    """Turns sightings into opportunity, using the map rather than authored alibis.
+
+    A sighting exonerates only when the geometry says so: too far from the
+    Study, with too few steps left to get there.
+    """
+
+    def __init__(self, sim):
+        self.sim = sim
+
+    def had_opportunity(self, room, t):
+        """Could a person seen in `room` at time `t` have done the killing?"""
+        return can_reach(self.sim.spatial, room, self.sim.crime_scene, self.sim.murder_time - t)
+
+    def could_have_left_trace(self, room, t):
+        """...and then reached the room where the footprint was found."""
+        last = self.sim.time_steps - 1
+        flee_room = self.sim.trajectories[self.sim.culprit][last]
+        return self.had_opportunity(room, t) and can_reach(
+            self.sim.spatial, self.sim.crime_scene, flee_room, last - self.sim.murder_time)
+
+    def exonerating_sighting(self, who):
+        """Earliest sighting of `who` that the map alone proves innocent.
+
+        Falls back to the moment of the murder, where being anywhere but the
+        Study is its own alibi — innocents are never at the scene then, so this
+        always terminates.
+        """
+        for t in range(self.sim.murder_time + 1):
+            room = self.sim.trajectories[who][t]
+            if not self.had_opportunity(room, t):
+                return t, room
+        return self.sim.murder_time, self.sim.trajectories[who][self.sim.murder_time]
+
+
+class CausalRealityGraph:
+    """What actually happened. Events are nodes, causal links are edges.
+
+    Held strictly apart from the epistemic layer: this is ground truth, and
+    nothing here is available to the investigation until a clue exposes it.
+    """
+
+    def __init__(self, sim):
+        self.sim = sim
+        self.graph = nx.DiGraph()
+
+    def build(self):
+        sim = self.sim
+        last = sim.time_steps - 1
+        flee_room = sim.trajectories[sim.culprit][last]
+
+        def event(node, t, description, *causes):
+            self.graph.add_node(node, t=t, description=description)
+            for c in causes:
+                self.graph.add_edge(c, node)
+
+        event("victim_arrives", sim.murder_time, f"{sim.victim} enters the {sim.crime_scene}")
+        event("culprit_arrives", sim.murder_time, f"{sim.culprit} enters the {sim.crime_scene}")
+        event("murder", sim.murder_time, f"{sim.culprit} kills {sim.victim} in the {sim.crime_scene}",
+              "victim_arrives", "culprit_arrives")
+        event("flight", last, f"{sim.culprit} flees to the {flee_room}", "murder")
+        event("footprint_left", last, f"Mud from the flight is left in the {flee_room}", "flight")
+        event("discovery", last, f"{sim.victim}'s body is found in the {sim.crime_scene}", "murder")
+        return self.graph
+
+    def traces_to_murder(self):
+        """Every event must connect to the killing, or it does not belong in the story."""
+        g = self.graph.to_undirected()
+        return all(nx.has_path(g, n, "murder") for n in self.graph)
+
+    def causes_precede_effects(self):
+        """A cause cannot happen after its effect. Cheap check, catches real errors."""
+        return all(self.graph.nodes[u]["t"] <= self.graph.nodes[v]["t"] for u, v in self.graph.edges)
+
+
 class EpistemicClueGraph:
     """What the investigation can know, and whether that is enough to solve it."""
 
     def __init__(self, sim):
         self.sim = sim
         self.dag = nx.DiGraph()
+        self.engine = AlibiEngine(sim)
 
     def build_clues(self):
         sim = self.sim
@@ -111,11 +200,11 @@ class EpistemicClueGraph:
         # One sighting per innocent. A single witness leaves the rest of the cast
         # equally guilty, which is the unfairness this layer exists to prevent.
         for who in sim.witnesses():
-            room = sim.trajectories[who][sim.murder_time]
+            t, room = self.engine.exonerating_sighting(who)
             node = f"Clue_Alibi_{who.replace(' ', '_')}"
             self.dag.add_node(
-                node, kind="alibi", who=who, room=room, t=sim.murder_time,
-                description=f"{who} was seen in the {room} at t={sim.murder_time}")
+                node, kind="alibi", who=who, room=room, t=t,
+                description=f"{who} was seen in the {room} at t={t}")
             self.dag.add_edge("Root", node)
             self.dag.add_edge(node, "Deduction_Culprit")
 
@@ -131,7 +220,7 @@ class EpistemicClueGraph:
         """
         alibied = {
             d["who"] for _, d in self.dag.nodes(data=True)
-            if d.get("kind") == "alibi" and d["room"] != self.sim.crime_scene
+            if d.get("kind") == "alibi" and not self.engine.could_have_left_trace(d["room"], d["t"])
         }
         return set(self.sim.suspects) - alibied
 
@@ -147,6 +236,10 @@ class EpistemicClueGraph:
 def build(seed=None):
     sim = WorldSimulation(SpatialGraph(), seed=seed)
     sim.generate_timeline()
+    # Ground truth hangs off the sim rather than widening the return value,
+    # which several callers already unpack as a pair.
+    sim.causal = CausalRealityGraph(sim)
+    sim.causal.build()
     clues = EpistemicClueGraph(sim)
     clues.build_clues()
     if not clues.validate_solvability():
@@ -176,6 +269,24 @@ def _self_check():
         assert sim.culprit not in sim.witnesses(), "the culprit cannot be their own alibi"
         assert clues.validate_solvability()
         assert nx.has_path(clues.dag, "Root", "Deduction_Culprit")
+
+        causal = sim.causal
+        assert nx.is_directed_acyclic_graph(causal.graph), "ground truth cannot contain a causal loop"
+        assert causal.traces_to_murder(), "every event must trace back to the killing"
+        assert causal.causes_precede_effects(), "a cause must not happen after its effect"
+        assert nx.has_path(causal.graph, "murder", "footprint_left"), "the footprint must descend from the murder"
+        assert sim.culprit in causal.graph.nodes["murder"]["description"]
+
+        # Alibis must be earned from the map, not asserted. Every sighting used
+        # as an alibi has to be one the geometry actually rules out, and the
+        # culprit's own position must never produce one.
+        engine = clues.engine
+        for _, d in clues.dag.nodes(data=True):
+            if d.get("kind") == "alibi":
+                assert not engine.could_have_left_trace(d["room"], d["t"]), (
+                    f"seed {s}: {d['who']} seen in {d['room']} at t={d['t']} could still have done it")
+        culprit_room = sim.trajectories[sim.culprit][sim.murder_time]
+        assert engine.could_have_left_trace(culprit_room, sim.murder_time), "the culprit must have had opportunity"
         # The solver never sees sim.culprit; it must land on them anyway.
         assert clues.suspects_consistent_with_clues() == {sim.culprit}, (
             f"seed {s}: clues admit {clues.suspects_consistent_with_clues()}, culprit is {sim.culprit}")
