@@ -189,6 +189,9 @@ class EpistemicClueGraph:
     def build_clues(self):
         sim = self.sim
         self.dag.add_node("Root", kind="root", description=f"Body found in the {sim.crime_scene} at t={sim.time_steps - 1}")
+        # Declared before anything points at it: add_edge would otherwise create
+        # it as a bare, attribute-less node that mid-build inspection would see.
+        self.dag.add_node("Deduction_Culprit", kind="deduction", description="The culprit is whoever has no alibi")
 
         flee_room = sim.trajectories[sim.culprit][sim.time_steps - 1]
         self.dag.add_node(
@@ -208,7 +211,6 @@ class EpistemicClueGraph:
             self.dag.add_edge("Root", node)
             self.dag.add_edge(node, "Deduction_Culprit")
 
-        self.dag.add_node("Deduction_Culprit", kind="deduction", description="The culprit is whoever has no alibi")
         return self.dag
 
     def suspects_consistent_with_clues(self):
