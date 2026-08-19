@@ -208,41 +208,42 @@ def _check_matrix_gate():
     style one: the failing cases below are the point of the feature."""
     import io
     import json as _json
-    import os
     import tempfile
     from contextlib import redirect_stderr
 
-    path = tempfile.mktemp(suffix=".json")
     good = [[1.0 if i == j else 0.0 for j in range(5)] for i in range(5)]
     good[0][4] = 0.2
 
-    def write(obj):
-        with open(path, "w") as f:
-            _json.dump(obj, f)
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/m.json"
 
-    rejected = [
-        (good, "a bare 5x5 array -- the old unsourced shape"),
-        ({"matrix": good}, "matrix with no source"),
-        ({"source": "Smith 2019"}, "source with no matrix"),
-        ({"matrix": good, "source": ""}, "empty source"),
-        ({"matrix": good, "source": "   "}, "whitespace-only source"),
-        ({"matrix": good, "source": 42}, "non-string source"),
-        ({"matrix": good[:4], "source": "Smith 2019"}, "4x5 matrix"),
-        ({"matrix": [["x"] * 5] + good[1:], "source": "Smith 2019"}, "non-numeric entry"),
-    ]
-    for obj, why in rejected:
-        write(obj)
-        try:
-            load_matrix(path)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"{why} should have been rejected")
+        def write(obj):
+            with open(path, "w") as f:
+                _json.dump(obj, f)
 
-    # A sourced matrix loads, keeps its citation, and announces it when applied.
-    write({"matrix": good, "source": "  Smith et al. 2019, J. Cross-Cult. Psych.  "})
-    cm = load_matrix(path)
-    assert cm.source == "Smith et al. 2019, J. Cross-Cult. Psych.", "citation is stripped and kept"
+        rejected = [
+            (good, "a bare 5x5 array -- the old unsourced shape"),
+            ({"matrix": good}, "matrix with no source"),
+            ({"source": "Smith 2019"}, "source with no matrix"),
+            ({"matrix": good, "source": ""}, "empty source"),
+            ({"matrix": good, "source": "   "}, "whitespace-only source"),
+            ({"matrix": good, "source": 42}, "non-string source"),
+            ({"matrix": good[:4], "source": "Smith 2019"}, "4x5 matrix"),
+            ({"matrix": [["x"] * 5] + good[1:], "source": "Smith 2019"}, "non-numeric entry"),
+        ]
+        for obj, why in rejected:
+            write(obj)
+            try:
+                load_matrix(path)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{why} should have been rejected")
+
+        # A sourced matrix loads, keeps its citation, and announces it when applied.
+        write({"matrix": good, "source": "  Smith et al. 2019, J. Cross-Cult. Psych.  "})
+        cm = load_matrix(path)
+        assert cm.source == "Smith et al. 2019, J. Cross-Cult. Psych.", "citation is stripped and kept"
 
     err = io.StringIO()
     with redirect_stderr(err):
@@ -252,7 +253,6 @@ def _check_matrix_gate():
 
     # The identity path still takes a bare list, so tests make no claim about anyone.
     assert Ocean(openness=0.5).transform(IDENTITY).openness == 0.5
-    os.unlink(path)
 
 
 def _check_profile_io():
