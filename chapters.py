@@ -75,12 +75,17 @@ def _prompt(payload):
 
 
 def write_chapters(sim, clues, model="llama3", generate_fn=generate, narrator=NARRATOR):
-    """One chapter per DAG node, in topological order.
+    """One chapter per DAG node, in topological order, earliest event first.
 
     generate_fn is injectable so the whole pipeline runs without a model.
-    Lexicographic tie-breaking keeps chapter order reproducible run to run.
+    Ties break on event time then node name, so chapter order is reproducible
+    and the investigation uncovers sightings oldest-first instead of
+    alphabetically. Chapter one is still the discovery of the body: Root is an
+    ancestor of every clue, so no ordering can precede it, and opening on the
+    corpse is what a mystery does anyway.
     """
-    order = list(nx.lexicographical_topological_sort(clues.dag))
+    order = list(nx.lexicographical_topological_sort(
+        clues.dag, key=lambda n: (clues.dag.nodes[n].get("t", 0), n)))
     prose, chapters = {}, []
     for node in order:
         payload = _payload(clues, node, order, prose, sim)
@@ -107,6 +112,13 @@ def _self_check():
         for u, v in clues.dag.edges:
             assert rank[u] < rank[v], f"seed {seed}: {u} must be told before {v}"
         assert chapters[0]["prose"] == "chapter 1 in a voice with O=0.7", "prose is stripped"
+
+        # Chronology: within what the DAG allows, earlier events are narrated
+        # first. Root is everyone's ancestor so it stays chapter one; the clues
+        # between it and the deduction must run oldest sighting first.
+        assert nodes[0] == "Root" and nodes[-1] == "Deduction_Culprit"
+        times = [clues.dag.nodes[n]["t"] for n in nodes[1:-1]]
+        assert times == sorted(times), f"seed {seed}: clues out of chronological order: {list(zip(nodes[1:-1], times))}"
 
         for c in chapters:
             established = {f["node"] for f in c["payload"]["established"]}

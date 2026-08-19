@@ -188,10 +188,14 @@ class EpistemicClueGraph:
 
     def build_clues(self):
         sim = self.sim
-        self.dag.add_node("Root", kind="root", description=f"Body found in the {sim.crime_scene} at t={sim.time_steps - 1}")
+        last = sim.time_steps - 1
+        self.dag.add_node("Root", kind="root", t=last,
+                          description=f"Body found in the {sim.crime_scene} at t={last}")
         # Declared before anything points at it: add_edge would otherwise create
         # it as a bare, attribute-less node that mid-build inspection would see.
-        self.dag.add_node("Deduction_Culprit", kind="deduction", description="The culprit is whoever has no alibi")
+        # t sits past the last event because the deduction is reached after them.
+        self.dag.add_node("Deduction_Culprit", kind="deduction", t=sim.time_steps,
+                          description="The culprit is whoever has no alibi")
 
         flee_room = sim.trajectories[sim.culprit][sim.time_steps - 1]
         self.dag.add_node(
