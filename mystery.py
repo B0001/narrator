@@ -99,25 +99,49 @@ class EpistemicClueGraph:
 
     def build_clues(self):
         sim = self.sim
-        self.dag.add_node("Root", description=f"Body found in the {sim.crime_scene} at t={sim.time_steps - 1}")
+        self.dag.add_node("Root", kind="root", description=f"Body found in the {sim.crime_scene} at t={sim.time_steps - 1}")
 
         flee_room = sim.trajectories[sim.culprit][sim.time_steps - 1]
-        self.dag.add_node("Clue_Footprint", description=f"Muddy footprint found in the {flee_room}")
+        self.dag.add_node(
+            "Clue_Footprint", kind="trace", room=flee_room, t=sim.time_steps - 1,
+            description=f"Muddy footprint found in the {flee_room}")
         self.dag.add_edge("Root", "Clue_Footprint")
-
-        witness = sim.witnesses()[0]
-        witness_room = sim.trajectories[witness][sim.murder_time]
-        self.dag.add_node("Clue_Witness", description=f"{witness} was seen in the {witness_room} at t={sim.murder_time}")
-        self.dag.add_edge("Root", "Clue_Witness")
-
-        self.dag.add_node("Deduction_Culprit", description=f"The culprit is {sim.culprit}")
         self.dag.add_edge("Clue_Footprint", "Deduction_Culprit")
-        self.dag.add_edge("Clue_Witness", "Deduction_Culprit")
+
+        # One sighting per innocent. A single witness leaves the rest of the cast
+        # equally guilty, which is the unfairness this layer exists to prevent.
+        for who in sim.witnesses():
+            room = sim.trajectories[who][sim.murder_time]
+            node = f"Clue_Alibi_{who.replace(' ', '_')}"
+            self.dag.add_node(
+                node, kind="alibi", who=who, room=room, t=sim.murder_time,
+                description=f"{who} was seen in the {room} at t={sim.murder_time}")
+            self.dag.add_edge("Root", node)
+            self.dag.add_edge(node, "Deduction_Culprit")
+
+        self.dag.add_node("Deduction_Culprit", kind="deduction", description="The culprit is whoever has no alibi")
         return self.dag
+
+    def suspects_consistent_with_clues(self):
+        """Independent solver: who survives the clue set?
+
+        Deliberately reads only the clues and the cast — never sim.culprit. If
+        this returns anything but a single name, the mystery is unfair and the
+        generator is wrong, which is the whole point of checking it this way.
+        """
+        alibied = {
+            d["who"] for _, d in self.dag.nodes(data=True)
+            if d.get("kind") == "alibi" and d["room"] != self.sim.crime_scene
+        }
+        return set(self.sim.suspects) - alibied
 
     def validate_solvability(self):
         """A mystery nobody can reason their way to is not a mystery."""
-        return nx.is_directed_acyclic_graph(self.dag) and nx.has_path(self.dag, "Root", "Deduction_Culprit")
+        return (
+            nx.is_directed_acyclic_graph(self.dag)
+            and nx.has_path(self.dag, "Root", "Deduction_Culprit")
+            and len(self.suspects_consistent_with_clues()) == 1
+        )
 
 
 def build(seed=None):
@@ -152,12 +176,21 @@ def _self_check():
         assert sim.culprit not in sim.witnesses(), "the culprit cannot be their own alibi"
         assert clues.validate_solvability()
         assert nx.has_path(clues.dag, "Root", "Deduction_Culprit")
-        assert clues.dag.nodes["Deduction_Culprit"]["description"].endswith(sim.culprit)
+        # The solver never sees sim.culprit; it must land on them anyway.
+        assert clues.suspects_consistent_with_clues() == {sim.culprit}, (
+            f"seed {s}: clues admit {clues.suspects_consistent_with_clues()}, culprit is {sim.culprit}")
 
     # Every clue must be derived from the simulation, never invented.
     sim, clues = build(seed=3)
     footprint = clues.dag.nodes["Clue_Footprint"]["description"]
     assert sim.trajectories[sim.culprit][sim.time_steps - 1] in footprint
+
+    # Under-clued mysteries must fail loudly: drop one alibi and two suspects
+    # remain equally guilty, so solvability has to go false.
+    dropped = next(n for n, d in clues.dag.nodes(data=True) if d.get("kind") == "alibi")
+    clues.dag.remove_node(dropped)
+    assert len(clues.suspects_consistent_with_clues()) == 2, "removing an alibi must widen the suspect set"
+    assert not clues.validate_solvability(), "an under-clued mystery must not validate"
 
     print("ok")
 
@@ -172,6 +205,8 @@ if __name__ == "__main__":
         print("\nInvestigation:")
         for n in nx.topological_sort(clues.dag):
             print(f"  {n:20} {clues.dag.nodes[n]['description']}")
-        print(f"\nSolvable: {clues.validate_solvability()}")
+        deduced = clues.suspects_consistent_with_clues()
+        print(f"\nSolver (clues only, blind to ground truth): {sorted(deduced)}")
+        print(f"Solvable: {clues.validate_solvability()}")
     else:
         _self_check()
