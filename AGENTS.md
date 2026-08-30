@@ -2,6 +2,33 @@
 
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
+## What this repo is
+
+A teaching project at the intersection of code generation and psychology, for
+an audience of three teenagers learning by building. Personality becomes a
+data structure, motive a graph traversal, and pathology an observable
+multi-agent interaction. See `prd.md` for the full spec and non-goals.
+
+## The claim this repo makes
+
+That a conclusion the system presents — a mystery's solution, or (in the
+newer C5 chatbot work) a deduction stated mid-conversation — actually follows
+from evidence that was checked independently of the thing that produced it,
+rather than merely asserted by it.
+
+`sandbox-prompt.md` states this standard in full, including the real bug
+(`narrator-cby.4.1`) that motivates it. Read it before writing code.
+
+## Producer / checker split
+
+The generating half and the verifying half are separate modules, and the
+checker does not get access to the producer's internals:
+`WorldSimulation`/the clue graph never gets read by `validate_solvability()`
+as ground truth, only as the clue set a real solver would see. C5's runtime
+admissibility check follows the same rule against the evidence ledger. A
+checker that can see the producer's internal state will agree with it and
+verify nothing.
+
 > **Architecture in one line:** Issues live in a local Dolt database
 > (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
 > git-compatible protocol), stored under `refs/dolt/data` on your git

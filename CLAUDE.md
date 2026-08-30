@@ -2,6 +2,33 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## What this repo is
+
+A teaching project at the intersection of code generation and psychology, for
+an audience of three teenagers learning by building. Personality becomes a
+data structure, motive a graph traversal, and pathology an observable
+multi-agent interaction. See `prd.md` for the full spec and non-goals.
+
+## The claim this repo makes
+
+That a conclusion the system presents — a mystery's solution, or (in the
+newer C5 chatbot work) a deduction stated mid-conversation — actually follows
+from evidence that was checked independently of the thing that produced it,
+rather than merely asserted by it.
+
+`sandbox-prompt.md` states this standard in full, including the real bug
+(`narrator-cby.4.1`) that motivates it. Read it before writing code.
+
+## Producer / checker split
+
+The generating half and the verifying half are separate modules, and the
+checker does not get access to the producer's internals:
+`WorldSimulation`/the clue graph never gets read by `validate_solvability()`
+as ground truth, only as the clue set a real solver would see. C5's runtime
+admissibility check follows the same rule against the evidence ledger. A
+checker that can see the producer's internal state will agree with it and
+verify nothing.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 
@@ -60,18 +87,39 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+uv sync
+uv run pytest
 ```
+
+Every module also self-checks standalone: `python3 <module>.py`.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+- `ocean.py` (C1) — Five-Factor trait vector compiled into Ollama sampler
+  settings and prompt injections.
+- `motive.py` (C2) — Seeded graph traversal over bias/trigger nodes; the
+  deterioration path doubles as a story outline.
+- `agents.py` / `metrics.py` (C3) — Round-robin multi-agent turn loop over a
+  shared transcript, plus interaction metrics. `narrator-cby.3.5` extends
+  this into a Stasser-Titus hidden-profile harness (clue partitioning +
+  pooling measures).
+- `mystery.py` (C4) — `WorldSimulation` + causal graph is the producer;
+  `validate_solvability()` is the checker, run against the clue graph only,
+  never the generator's internal claim of solvability.
+- C5 (`narrator-c5b`, in progress) — turns the same producer/checker shape
+  around into a fair-play chatbot. `evidence_ledger.py` is the producer's
+  visible surface; `admissibility.py` (inverted from `validate_solvability()`)
+  is the checker; `hypothesis_board.py`, `moves.py`, `chat_core.py`, and
+  `turn.py` are the turn loop around them. The `backends/` split and the
+  Fable/Anthropic backend are follow-on beads.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Stdlib first, few dependencies, for anything a learner reads (`prd.md`'s
+  legibility constraint). Dev-only tooling (`pytest`, `uv`) is exempt — it
+  never ships to a learner.
+- Every module ends with `if __name__ == "__main__": _self_check()` —
+  assert-based, no framework. `tests/` holds anything broader.
+- Producer and checker stay in separate functions/modules; the checker never
+  reads the producer's internal state, only its observable output.
