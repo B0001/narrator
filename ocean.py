@@ -1,7 +1,9 @@
-"""OCEAN personality vector -> Ollama generation parameters.
+"""OCEAN personality vector -> generation parameters for a text backend.
 
 Five-Factor traits are scalars in [-1.0, 1.0]. They compile into a system
-prompt and sampling options for a local Ollama model.
+prompt and sampling options that a `backends/` module turns into text --
+Ollama by default (`backends/ocean_ollama.py`, local, no key); see
+`backends/base.py` for the interface a second backend has to satisfy.
 
     python3 ocean.py                 # self-check
     python3 ocean.py --demo "..."    # generate against local ollama
@@ -9,8 +11,9 @@ prompt and sampling options for a local Ollama model.
 
 import json
 import sys
-import urllib.request
 from dataclasses import asdict, astuple, dataclass
+
+from backends.ocean_ollama import generate
 
 TRAITS = ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")
 
@@ -151,19 +154,6 @@ def load_matrix(path):
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise ValueError(f"{path}: matrix[{i}][{j}] must be a number, got {v!r}")
     return CultureMatrix(m, source.strip())
-
-
-def generate(profile, prompt, model="qwen2.5-coder:14b", host="http://localhost:11434"):
-    body = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "system": profile.system_prompt(),
-        "options": profile.options(),
-        "stream": False,
-    }).encode()
-    req = urllib.request.Request(f"{host}/api/generate", body, {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.load(r)["response"]
 
 
 def _self_check():
