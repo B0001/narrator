@@ -1,6 +1,7 @@
 """Backends that turn an Ocean profile + prompt into text.
 
-Ollama (`ocean_ollama.py`) is the only implementation so far and stays the
-default everywhere -- see `base.py` for the interface every backend
-(including the Fable one `narrator-c5b.2.2` adds) has to satisfy.
+Ollama (`ocean_ollama.py`) stays the default everywhere, local and keyless.
+Fable (`ocean_fable.py`) is the opt-in second implementation, cloud and
+keyed from `ANTHROPIC_API_KEY` -- see `base.py` for the interface both
+satisfy.
 """
