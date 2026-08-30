@@ -19,7 +19,39 @@ The audience is three teenagers learning by building. That drives two constraint
 
 - Not a psychometrics research tool. Outputs are illustrative, not clinically valid.
 - No claims about real people or populations. See "Cultural transformation" below.
-- No cloud model providers. Local Ollama only.
+
+## Decision: local-by-default, cloud opt-in (2026-08-29, `narrator-c5b.1`)
+
+Supersedes the former non-goal "No cloud model providers. Local Ollama only."
+C5 (`narrator-c5b`) adds a second generation backend behind the `Backend`
+protocol (`backends/base.py`): Anthropic's `/v1/messages`, model
+`claude-fable-5`. That's a real reversal for an audience of three teenagers,
+not a footnote, so it's recorded here rather than silently overwritten.
+
+- **What stays local by default.** Ollama (`backends/ocean_ollama.py`) is
+  what every existing entry point calls with no key set — `ocean.py`,
+  `agents.py`, `motive.py`, `chapters.py`, `turn.py`. Every caller keeps
+  running unchanged against a local model unless a learner deliberately
+  switches backends; no component is silently pointed at the network.
+- **What the cloud path is for.** Fable is opt-in per learner: for whoever
+  wants a stronger model without provisioning local hardware, or wants to
+  compare `claude-fable-5`'s output against a local model for the same
+  profile. It's a second backend behind the same protocol, not a
+  replacement for the local one. See `narrator-c5b.2.2` for the
+  implementation and `narrator-c5b.2.5` for which components are cheap
+  enough to actually run against it — `agents.converse`'s round-robin
+  transcript grows quadratically in turns, which is a real cost surface on
+  a metered backend, not a hypothetical.
+- **Who holds the key.** The learner. `ANTHROPIC_API_KEY` comes from the
+  environment only — never hardcoded, never read from a profile file, never
+  checked into source. A run against Fable with no key set must fail naming
+  the missing variable, not a raw connection error.
+- **Why this is a real change, not a formality.** Cloud calls mean API
+  keys, per-token cost, a network dependency, and a teenager's conversation
+  text leaving their machine. Those are the actual stakes the old non-goal
+  was fencing off. This decision doesn't remove the fence, it moves it:
+  cloud use stays possible, but never silent, never the default, and never
+  authorized by anyone but the person running it.
 
 ---
 
