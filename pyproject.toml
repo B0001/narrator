@@ -1,0 +1,20 @@
+[project]
+name = "narrator"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# The worker loop lives in the verified-sandbox package (`uv tool install
+# --editable`), not in this repo and not in its dependency graph -- it is a tool
+# the repo is driven by, not a library the repo uses. Only what genuinely
+# differs per repo belongs here; see that package's README for every key.
+[tool.sandbox]
+
+[tool.sandbox.forward-env]
+ANTHROPIC_API_KEY = "needed for the Fable backend task (narrator-c5b.2.2); unset means that work can't be tested"

@@ -9,3 +9,5 @@
 transcript.jsonl
 __pycache__/
 *.pyc
+.venv/
+.sandbox.lock/
