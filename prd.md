@@ -38,10 +38,37 @@ not a footnote, so it's recorded here rather than silently overwritten.
   compare `claude-fable-5`'s output against a local model for the same
   profile. It's a second backend behind the same protocol, not a
   replacement for the local one. See `narrator-c5b.2.2` for the
-  implementation and `narrator-c5b.2.5` for which components are cheap
-  enough to actually run against it — `agents.converse`'s round-robin
-  transcript grows quadratically in turns, which is a real cost surface on
-  a metered backend, not a hypothetical.
+  implementation and the cost table below (`narrator-c5b.2.5`) for which
+  components are cheap enough to actually point at it.
+- **Cost: which components are cheap enough for a metered backend.** Every
+  component below runs unchanged against either backend (`Backend` is one
+  protocol, `narrator-c5b.2.1`) — the difference is what a run costs, not
+  what it does:
+  - `ocean.py generate()`, `motive.py prose()` — one self-contained call
+    each; the tokens sent scale only with how much you ask for. Fine against
+    Fable by default.
+  - `chapters.py write_chapters()` — one call per clue node, and
+    `_payload()` feeds every ancestor chapter's prose and facts into each
+    later node's prompt, so later calls do carry earlier calls' output. It
+    stays bounded only because the clue DAG is a handful of fixed nodes
+    (Root → footprint + a few alibis → Deduction), not because the calls are
+    independent. Fine against Fable by default at that size.
+  - `turn.py run_turn()` — one or two calls per chat turn. It never replays
+    the conversation transcript, so it has no `converse()`-style quadratic
+    surface; but `_ledger_summary()` does embed every recorded ledger entry
+    on every turn, so the prompt grows linearly with the number of
+    observations logged (short one-line entries) — far slower than
+    `converse()`. Fine against Fable by default.
+  - `agents.converse()` — every turn's prompt carries the *entire*
+    transcript so far, so tokens-per-turn grow with turn count and
+    tokens-per-run grow quadratically in it: this is the one component
+    where "just let it run longer" is a real cost surface on a metered
+    backend, not a hypothetical (`narrator-c5b.2.5`). It defaults to a
+    `token_budget` ceiling (`DEFAULT_TOKEN_BUDGET` in `agents.py`) that
+    stops the run and names the projected token count and the configured
+    limit before a turn would exceed it, rather than spending past it
+    silently. Pass `token_budget=None` to disable the ceiling for a run you
+    know is free (e.g. local Ollama with time to spare).
 - **Who holds the key.** The learner. `ANTHROPIC_API_KEY` comes from the
   environment only — never hardcoded, never read from a profile file, never
   checked into source. A run against Fable with no key set must fail naming
