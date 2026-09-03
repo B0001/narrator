@@ -37,12 +37,26 @@ learner can point both modes at the same neurotic persona and read the
 sampler options straight off the recorded `Call`s -- that comparison *is*
 the lesson, and deleting single-pass would delete the ability to see it.
 
+narrator-9nl wires `question_selector.py` in on the same principle: when the
+reasoning call's decision resolves to `ask`, deciding *which* question is
+worth asking is another "what actually splits the board" judgment, not a
+voice one, so candidate generation (`question_selector.generate_candidates`)
+runs at `REASONING_PROFILE` too, over `core.board` -- the same live board
+`ChatCore.conclude()` reads, never a copy -- and `select_question()`'s
+winner, not the model's free-form invention, is what the voice call is told
+to ask. `TWO_PASS` only: `SINGLE_PASS` makes exactly one call by design (see
+its own self-check), and inserting a second, board-reading call there would
+break that invariant for a mode that exists specifically to demonstrate what
+happens *without* a separated reasoning step.
+
     python3 turn.py   # self-check
 """
 
 import json
 from dataclasses import dataclass
 
+import moves
+import question_selector
 from ocean import Ocean
 
 TWO_PASS = "two_pass"
@@ -50,6 +64,7 @@ SINGLE_PASS = "single_pass"
 MODES = frozenset({TWO_PASS, SINGLE_PASS})
 
 REASONING_TEMPERATURE = 0.2
+ASK_CANDIDATE_COUNT = 3
 
 
 class ReasoningProfile(Ocean):
@@ -90,6 +105,7 @@ class TurnOutput:
     turn_log: "moves.TurnLog"  # noqa: F821 -- forward ref, moves imported lazily below
     ruled_out: tuple
     reply: str
+    question_log: "question_selector.SelectionLog | None" = None  # only set when this turn's move is "ask"
 
 
 def _ledger_summary(ledger):
@@ -126,13 +142,35 @@ def _combined_prompt(ledger, turn, user_message, live_ids):
     )
 
 
-def _voice_prompt(turn_log, user_message):
+def _voice_prompt(turn_log, user_message, ask_text=None):
+    ask_clause = f"The specific question to ask the user is: {ask_text!r}. " if ask_text else ""
     return (
         f"The reasoning channel chose to {turn_log.move} this turn, because "
-        f"{turn_log.reason}. Write the reply in character, in your own voice, "
-        f"responding to: {user_message!r}. Do not mention the reasoning "
+        f"{turn_log.reason}. {ask_clause}Write the reply in character, in your own "
+        f"voice, responding to: {user_message!r}. Do not mention the reasoning "
         "channel, the ledger, or admissibility -- just speak."
     )
+
+
+def _ask_candidate_call(core, turn, generate_fn, model):
+    """When the reasoning channel's move resolves to `ask`, generate and
+    score candidate questions over the board's *live* hypotheses -- the
+    same board `core.conclude()` already reads, not a mock -- and hand back
+    both the `Call` (so this model invocation is as observable as reasoning
+    and voice) and the `SelectionLog` (so a caller can see every candidate
+    considered, not just the winner).
+
+    Pinned to `REASONING_PROFILE`, same as the reasoning call: choosing
+    *which* question is worth asking is a "what actually splits the board"
+    decision, not a persona-voice one, so it must not be run at a persona's
+    drifting sampler settings either.
+    """
+    prompt = question_selector.candidate_prompt(core.board, n=ASK_CANDIDATE_COUNT)
+    raw = generate_fn(REASONING_PROFILE, prompt, model=model)
+    call = Call("ask-candidates", REASONING_PROFILE, REASONING_PROFILE.options(), prompt, raw)
+    candidates = question_selector.parse_candidates(core.board, raw)
+    selection = question_selector.select_question(core.board, turn, candidates)
+    return call, selection
 
 
 def _parse_decision(raw, require_reply):
@@ -180,11 +218,19 @@ def run_turn(core, persona, turn, user_message, generate_fn, model="qwen2.5-code
     decision = _parse_decision(raw, require_reply=False)
     result = core.conclude(turn, decision["cited"], decision["move"], rule_out=decision["rule_out"])
 
-    voice_prompt = _voice_prompt(result.turn_log, user_message)
+    question_log = None
+    ask_text = None
+    if result.turn_log.move == moves.ASK:
+        ask_call, question_log = _ask_candidate_call(core, turn, generate_fn, model)
+        calls.append(ask_call)
+        if question_log.chosen is not None:
+            ask_text = next(s.text for s in question_log.scored if s.id == question_log.chosen)
+
+    voice_prompt = _voice_prompt(result.turn_log, user_message, ask_text=ask_text)
     reply_raw = generate_fn(persona, voice_prompt, model=model)
     calls.append(Call("voice", persona, persona.options(), voice_prompt, reply_raw))
 
-    return TurnOutput(mode, tuple(calls), result.turn_log, result.ruled_out, reply_raw.strip())
+    return TurnOutput(mode, tuple(calls), result.turn_log, result.ruled_out, reply_raw.strip(), question_log)
 
 
 def _self_check():
@@ -235,6 +281,7 @@ def _self_check():
             assert out.ruled_out == ()
             assert core.board.live_ids() == ["blackwood", "margaret", "ellis", "jeeves"]
             assert len(out.calls) == 2 and out.calls[0].label == "reasoning" and out.calls[1].label == "voice"
+            assert out.question_log is None, "question_log is only populated when the move actually resolves to ask"
 
             # Turn 1: ground the inference, then reveal through the disciplined persona.
             core.observe("photo", 1, "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact")
@@ -263,6 +310,116 @@ def _self_check():
             assert voice_call.profile is disciplined
             assert voice_call.options == disciplined.options()
             assert str(disciplined.options()["temperature"]) in voice_call.raw
+
+    # --- two_pass ask: when the reasoning channel's move resolves to `ask`,
+    # the actual question comes from question_selector.select_question() run
+    # over the real board (core.board, not a stand-in), and the
+    # candidate-generation call is pinned to REASONING_PROFILE exactly like
+    # the decision call -- deciding what's worth asking is the same kind of
+    # "what actually splits the board" judgment, not a persona-voice one. ---
+    with tempfile.TemporaryDirectory() as d:
+        with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
+            core.observe("saw_margaret", 0, "user: 'I saw Lady Margaret near the Library'", "stated_by_user")
+
+            seen_ask_prompts, seen_ask_options = [], []
+
+            def fake_ask_generate(profile, prompt, model=None):
+                if "Propose up to" in prompt:
+                    seen_ask_prompts.append(prompt)
+                    seen_ask_options.append(profile.options())
+                    return json.dumps({"candidates": [
+                        {
+                            "id": "whereabouts",
+                            "text": "Where were you at the time of the murder?",
+                            "predicted_answers": {
+                                "blackwood": "study", "margaret": "garden",
+                                "ellis": "library", "jeeves": "kitchen",
+                            },
+                        },
+                        {
+                            "id": "boring",
+                            "text": "What did you have for breakfast?",
+                            "predicted_answers": {
+                                "blackwood": "eggs", "margaret": "eggs",
+                                "ellis": "eggs", "jeeves": "eggs",
+                            },
+                        },
+                    ]})
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "ask", "cited": [], "rule_out": None})
+                return f"(voice reply for prompt of length {len(prompt)})"
+
+            out = run_turn(core, neurotic, 0, "hmm, not sure who to suspect", fake_ask_generate, mode=TWO_PASS)
+            assert out.turn_log.move == moves.ASK
+            assert [c.label for c in out.calls] == ["reasoning", "ask-candidates", "voice"]
+
+            # Candidate generation ran at the reasoning channel's fixed
+            # profile, never the neurotic persona's own (drifting) sampler.
+            ask_call = out.calls[1]
+            assert ask_call.profile is REASONING_PROFILE
+            assert ask_call.options == REASONING_PROFILE.options()
+            assert seen_ask_options[0]["temperature"] == REASONING_TEMPERATURE
+
+            # The candidate prompt saw every currently-live hypothesis and
+            # nothing else -- this board has no ruled-out hypotheses yet, so
+            # this just confirms the wiring reads core.board, not a mock.
+            for hid in ("blackwood", "margaret", "ellis", "jeeves"):
+                assert hid in seen_ask_prompts[0]
+
+            # Every candidate is logged, and the discriminating one won.
+            assert out.question_log is not None
+            assert {s.id for s in out.question_log.scored} == {"whereabouts", "boring"}
+            assert out.question_log.chosen == "whereabouts"
+
+            # The winning question's text, not the board or the ledger, is
+            # what actually reaches the voice call.
+            voice_call = out.calls[2]
+            assert "Where were you at the time of the murder?" in voice_call.prompt
+
+            # Rule out every hypothesis but one candidate can't discriminate
+            # between (blackwood vs. ellis) -- no candidate on offer splits
+            # the survivors, so `chosen` must honestly be None, and the voice
+            # call must not claim a specific question that doesn't exist.
+            core.observe("photo", 1, "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact")
+            core.observe("strong_inference", 1, "Margaret could not have been at the scene", "inferred_by_model", supports=("photo",))
+            core.conclude(1, ["strong_inference"], moves.REVEAL, rule_out="margaret")
+            core.observe("alibi", 1, "user: 'Jeeves was in London all week'", "stated_by_user")
+            core.conclude(1, ["alibi"], moves.REVEAL, rule_out="jeeves")
+            assert set(core.board.live_ids()) == {"blackwood", "ellis"}
+
+            def fake_ask_boring(profile, prompt, model=None):
+                if "Propose up to" in prompt:
+                    return json.dumps({"candidates": [
+                        {
+                            "id": "boring",
+                            "text": "What did you have for breakfast?",
+                            "predicted_answers": {"blackwood": "eggs", "ellis": "eggs"},
+                        },
+                    ]})
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "ask", "cited": [], "rule_out": None})
+                return "(voice reply)"
+
+            out2 = run_turn(core, disciplined, 2, "well?", fake_ask_boring, mode=TWO_PASS)
+            assert out2.turn_log.move == moves.ASK
+            assert out2.question_log.chosen is None
+            assert "specific question" not in out2.calls[-1].prompt
+
+            # A candidate generator that produces malformed JSON is a named
+            # failure, same discipline as the reasoning channel's own parse.
+            def fake_ask_garbage(profile, prompt, model=None):
+                if "Propose up to" in prompt:
+                    return "not json"
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "ask", "cited": [], "rule_out": None})
+                return "(voice reply)"
+
+            try:
+                run_turn(core, disciplined, 3, "?", fake_ask_garbage, mode=TWO_PASS)
+            except ValueError as e:
+                assert "did not return JSON" in str(e)
+            else:
+                raise AssertionError("a candidate generator returning non-JSON should have been rejected")
 
     # --- single_pass: persona options reach the one call that both decides
     # and speaks -- this is the mode the bead keeps around so the difference

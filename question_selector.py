@@ -36,6 +36,7 @@ more thing, not several.
     python3 question_selector.py   # self-check
 """
 
+import json
 from dataclasses import dataclass
 
 _EPS = 1e-9
@@ -125,6 +126,78 @@ def select_question(board, turn, candidates):
     winners = [s for s in scored if s.discriminates]
     chosen = max(winners, key=lambda s: s.score).id if winners else None
     return SelectionLog(turn, scored, chosen)
+
+
+def candidate_prompt(board, n=3):
+    """Build the prompt for the candidate-generation call.
+
+    The only state that reaches this string is `board.dump()`'s *live*
+    hypotheses -- id and statement, nothing else. No ledger entry, no
+    ruled-out hypothesis, no persona, no hidden ground truth is in scope,
+    because this function's signature does not admit any of those: it takes
+    a board and a count, full stop. That is the same discipline
+    `suspects_consistent_with_clues()` applies to `sim.culprit` and
+    `chapters.py` applies to the culprit's name before the deduction chapter
+    -- provable by what the function *can* reach, not by a promise about
+    what it won't.
+    """
+    live = [h for h in board.dump()["hypotheses"] if h["live"]]
+    lines = "\n".join(f"- {h['id']}: {h['statement']}" for h in live)
+    return (
+        "You are the question-generation channel of a fair-play mystery chatbot.\n"
+        f"Propose up to {n} short clarifying questions to ask the user next. For each "
+        "question, predict what the user would answer under every live hypothesis "
+        "below -- you do not know which hypothesis is true, only what each one, if "
+        "it were true, would predict the answer to be.\n\n"
+        f"Live hypotheses:\n{lines}\n\n"
+        "Return JSON only, no other text: "
+        '{"candidates": [{"id": "<short id>", "text": "<question>", '
+        '"predicted_answers": {"<hypothesis id>": "<predicted answer>", '
+        "... one entry per live hypothesis id listed above}}]}"
+    )
+
+
+def parse_candidates(board, raw):
+    """Parse the candidate-generation call's raw output into `Candidate`s.
+
+    Checks the same completeness rule `score_candidate` enforces --
+    every live hypothesis needs a predicted answer -- but here, so a
+    malformed or lazy model response is a named `ValueError` at the source,
+    not a `KeyError` raised later, deep inside `select_question`.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"candidate generator did not return JSON: {raw!r}") from e
+
+    raw_candidates = data.get("candidates") if isinstance(data, dict) else None
+    if not raw_candidates:
+        raise ValueError(f"candidate generator returned no candidates: {raw!r}")
+
+    live_ids = {h["id"] for h in board.dump()["hypotheses"] if h["live"]}
+    candidates = []
+    for c in raw_candidates:
+        predicted = c.get("predicted_answers", {})
+        missing = sorted(live_ids - set(predicted))
+        if missing:
+            raise ValueError(
+                f"candidate {c.get('id')!r} missing predictions for live hypotheses: {missing}"
+            )
+        candidates.append(Candidate(c["id"], c["text"], {hid: predicted[hid] for hid in live_ids}))
+    return tuple(candidates)
+
+
+def generate_candidates(board, profile, generate_fn, model="qwen2.5-coder:14b", n=3):
+    """One model call, over `candidate_prompt(board, n)` alone, producing
+    scoreable candidates. `generate_fn` follows the repo-wide injectable
+    shape (`profile, prompt, model=...`), same as `ocean.generate` /
+    `turn.run_turn` / `panel.run_panel`, so a caller can pin `profile` to a
+    persona-neutral one (`turn.REASONING_PROFILE`) the same way the
+    reasoning channel itself is pinned, and a self-check can swap in a
+    scripted stub with no model at all.
+    """
+    raw = generate_fn(profile, candidate_prompt(board, n=n), model=model)
+    return parse_candidates(board, raw)
 
 
 def _self_check():
@@ -227,6 +300,68 @@ def _self_check():
     )
     log4 = select_question(board, 5, [still_valid])
     assert log4.chosen == "alibi"
+
+    # --- candidate generation: the prompt can only ever carry live hypotheses.
+    # jeeves was ruled out above; a leaked reference to jeeves or his statement
+    # would mean this function saw more than board.dump() exposes as live --
+    # the same leak check chapters.py runs for sim.culprit before the
+    # deduction chapter, aimed at the one piece of state this module must
+    # never see: a hypothesis the board itself has already killed.
+    prompt = candidate_prompt(board, n=2)
+    assert "jeeves" not in prompt.lower()
+    assert "Butler Jeeves" not in prompt
+    for live_id in ("blackwood", "margaret", "ellis"):
+        assert live_id in prompt
+
+    def fake_candidate_generate(profile, prompt, model=None):
+        assert "jeeves" not in prompt.lower(), "candidate generator must never see a ruled-out hypothesis"
+        return json.dumps({"candidates": [
+            {
+                "id": "whereabouts2",
+                "text": "Where were you at the time of the murder?",
+                "predicted_answers": {"blackwood": "study", "margaret": "garden", "ellis": "library"},
+            },
+            {
+                "id": "boring2",
+                "text": "What did you have for breakfast?",
+                "predicted_answers": {"blackwood": "eggs", "margaret": "eggs", "ellis": "eggs"},
+            },
+        ]})
+
+    generated = generate_candidates(board, profile=None, generate_fn=fake_candidate_generate)
+    assert {c.id for c in generated} == {"whereabouts2", "boring2"}
+    log5 = select_question(board, 6, list(generated))
+    assert log5.chosen == "whereabouts2"
+
+    # A candidate generator that skips a live hypothesis's prediction is a
+    # named failure at parse time, not a KeyError raised later inside scoring.
+    def fake_incomplete_generate(profile, prompt, model=None):
+        return json.dumps({"candidates": [
+            {"id": "bad", "text": "text", "predicted_answers": {"blackwood": "x"}},
+        ]})
+
+    try:
+        generate_candidates(board, profile=None, generate_fn=fake_incomplete_generate)
+    except ValueError as e:
+        assert "margaret" in str(e) or "ellis" in str(e)
+    else:
+        raise AssertionError("a candidate missing a live hypothesis's prediction should have been rejected")
+
+    # A candidate generator that returns no candidates at all, or non-JSON,
+    # is a named failure too -- never a silent empty selection.
+    try:
+        generate_candidates(board, profile=None, generate_fn=lambda p, t, model=None: json.dumps({"candidates": []}))
+    except ValueError as e:
+        assert "no candidates" in str(e)
+    else:
+        raise AssertionError("zero candidates from the generator should have been rejected")
+
+    try:
+        generate_candidates(board, profile=None, generate_fn=lambda p, t, model=None: "not json")
+    except ValueError as e:
+        assert "did not return JSON" in str(e)
+    else:
+        raise AssertionError("non-JSON candidate-generator output should have been rejected")
 
     print("ok")
 

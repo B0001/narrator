@@ -31,6 +31,27 @@ it has to reject *every* Ocean instance, including a default-valued one that
 merely looks neutral, because the claim is "cannot be weighted," not
 "currently weighted at zero."
 
+Where this sits relative to `chat_core.conclude()` / `turn.py` (decided in
+narrator-9nl, not built): nowhere new. `Checker.verdict()` is
+`admissibility.check()`, unmodified -- the exact same call `moves.choose_move`
+already runs, unconditionally, on every attempted `reveal`
+(`moves.py` -> `admissibility.check` -> gates `chat_core.conclude`). Running
+`run_panel()` inside that path would call the identical checker a second
+time; it would not verify anything `conclude()` hadn't already verified, it
+would just add two persona voices around the same yes/no. That is a
+presentation feature (let a user watch the proposer and critic argue before
+the checker rules) and a real one is welcome as its own bead, but it is not
+additional verification, so bolting it onto the turn loop under the "verify
+path" heading would overstate what changed. `panel.py` also stays clear of
+`chat_core.py` for a structural reason: `ChatCore.conclude()` is deliberately
+model-agnostic (no `generate_fn`, no persona) so its self-check needs no
+model; wiring `run_panel()` in would give it a model dependency it does not
+otherwise have, to call a checker it already calls. Decision: `panel.py`
+remains a standalone diagnostic -- the module that makes the
+propose/critique/check contrast something a self-check (or a learner) can
+run directly, per `run_panel`'s own docstring -- and is not invoked from
+`turn.run_turn` or `chat_core.ChatCore.conclude`.
+
     python3 panel.py   # self-check
 """
 
