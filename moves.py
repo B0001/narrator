@@ -23,6 +23,17 @@ consults. Here the checker (`admissibility.check`) sits directly in the
 `reveal` path -- there is no route from "I have a conclusion" to "I said it
 out loud" that skips the check.
 
+That claim needed one repair to stay true. A downgraded reveal's `reason`
+below is built from the checker's `missing` tuple, which used to quote the
+refused claim, and `turn._voice_prompt` handed the reason straight to the
+persona -- so the sentence the checker had just refused arrived at the
+speaking model anyway, while `move` still read `abstain` (narrator-7gj). The
+route existed; it ran through the reason string. Two things close it, and
+both matter: `admissibility` now names ids rather than quoting claims, and
+`turn._voice_prompt` withholds a blocked turn's reason from the voice
+entirely. `TurnLog.missing` below is unchanged -- the audit record is not
+the leak, the persona's copy of it was.
+
     python3 moves.py   # self-check
 """
 

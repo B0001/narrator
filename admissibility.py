@@ -47,6 +47,14 @@ def _grounded(ledger, entry_id, trail, missing):
     this into infinite recursion; a cycle is treated as ungrounded rather
     than crashing, since a chain that only ever points at itself never
     reaches the user either way.
+
+    `missing` names entry *ids* and why each failed, never the claim text
+    (narrator-7gj). The ledger already holds the claim under that id, so
+    copying it in here adds nothing an auditor cannot look up -- but it does
+    put the exact sentence this checker just refused into a string that
+    downstream code renders. It reached the persona voice prompt that way
+    once already. A checker's output travels further than its author expects;
+    the safe thing for it to carry is a pointer, not the refused content.
     """
     if entry_id in trail:
         missing.append(f"{entry_id} (circular support chain)")
@@ -59,12 +67,12 @@ def _grounded(ledger, entry_id, trail, missing):
     if entry.provenance in DIRECT:
         return True
     if entry.provenance == "assumed":
-        missing.append(f"{entry_id} (assumed, never verified: {entry.claim!r})")
+        missing.append(f"{entry_id} (assumed, never verified)")
         return False
 
     # inferred_by_model: grounded only if every one of its own supports is.
     if not entry.supports:
-        missing.append(f"{entry_id} (inferred with no cited support: {entry.claim!r})")
+        missing.append(f"{entry_id} (inferred with no cited support)")
         return False
     ok = True
     for support_id in entry.supports:
@@ -144,6 +152,33 @@ def _self_check():
             v = check(ledger, ["never_written"])
             assert not v.admissible
             assert any("never_written" in m for m in v.missing)
+
+            # narrator-7gj: `missing` names ids and the reason each failed --
+            # never the refused claim itself. This is checked over every
+            # blocked shape at once, on the strings the checker actually
+            # emits, because `missing` is rendered downstream by callers this
+            # module cannot see: it reached the persona voice prompt that way
+            # once. An id is a pointer into the ledger; the claim is the
+            # content the checker just refused, and a checker's output should
+            # not carry the thing it declined to let anyone say.
+            ledger.write("loud", 5, "Colonel Mustard strangled the parlourmaid", "inferred_by_model")
+            ledger.write("loud_premise", 5, "assuming the conservatory key was copied", "assumed")
+            ledger.write("loud_chain", 6, "so the Colonel had the run of the house", "inferred_by_model",
+                         supports=("loud_premise",))
+            # `missing` names the leg that actually failed, not every id on the
+            # way down to it -- same rule the assumed-chain case above relies
+            # on, so an ask can go after the evidence that would fix it.
+            for cited, must_name in (
+                (["loud"], "loud"),
+                (["loud_chain"], "loud_premise"),
+                (["loud", "loud_chain"], "loud_premise"),
+            ):
+                v = check(ledger, cited)
+                assert not v.admissible
+                blob = " | ".join(v.missing)
+                assert must_name in blob, f"{must_name} must be named as missing, got {v.missing}"
+                for leaked in ("Mustard", "strangled", "parlourmaid", "conservatory", "copied"):
+                    assert leaked not in blob, f"claim text leaked into missing: {leaked!r}"
 
     print("ok")
 

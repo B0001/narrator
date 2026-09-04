@@ -142,11 +142,41 @@ def _combined_prompt(ledger, turn, user_message, live_ids):
     )
 
 
+# What the voice is told when the checker refused the reveal it was asked for.
+# Fixed text: it names no entry, cites nothing, and says only what the persona
+# actually needs to act on -- that it is holding back.
+_BLOCKED_VOICE_REASON = "the evidence on the ledger does not support the conclusion it was about to state"
+
+
 def _voice_prompt(turn_log, user_message, ask_text=None):
+    """Build the persona call's prompt. This is a trust boundary, not a
+    formatting helper (narrator-7gj).
+
+    A reveal that `admissibility.check()` refused is the one turn whose
+    reason must not reach the voice. `moves.choose_move` builds that reason
+    out of the checker's `missing` tuple, which names the very entries it
+    just declined to let the bot assert -- and the voice call is handed no
+    ledger and no board, so that string would be nearly the whole prompt,
+    which makes paraphrasing the refused claim the model's most available
+    continuation. The reply then states the conclusion while `turn_log.move`
+    still records `abstain`: the audit record says the bot held back on a
+    turn where it did not. That is exactly the narrator-cby.4.1 shape, and it
+    would falsify moves.py's own invariant that "there is no route from 'I
+    have a conclusion' to 'I said it out loud' that skips the check" -- the
+    route would run through the reason string.
+
+    The full `missing` tuple stays on the `TurnLog`, which is where the audit
+    record wants it. Only the persona's copy is withheld. A directly
+    requested abstain keeps its own reason: nothing was refused there, so
+    there is nothing to withhold, and `missing` being empty is what tells
+    the two apart.
+    """
+    blocked = turn_log.move == moves.ABSTAIN and turn_log.missing
+    reason = _BLOCKED_VOICE_REASON if blocked else turn_log.reason
     ask_clause = f"The specific question to ask the user is: {ask_text!r}. " if ask_text else ""
     return (
         f"The reasoning channel chose to {turn_log.move} this turn, because "
-        f"{turn_log.reason}. {ask_clause}Write the reply in character, in your own "
+        f"{reason}. {ask_clause}Write the reply in character, in your own "
         f"voice, responding to: {user_message!r}. Do not mention the reasoning "
         "channel, the ledger, or admissibility -- just speak."
     )
@@ -480,6 +510,77 @@ def _self_check():
                 assert "not a mode" in str(e)
             else:
                 raise AssertionError("unknown mode should have been rejected")
+
+    # --- narrator-7gj: a reveal the checker refused must not smuggle the
+    # refused claim into the voice call. Same leak-check shape chapters.py
+    # uses for sim.culprit: name the one thing that must not cross the
+    # boundary, then assert on the actual string that crossed it -- not on a
+    # docstring promise that it won't. ---
+    with tempfile.TemporaryDirectory() as d:
+        with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
+            # A claim with distinctive words, so a leak cannot hide in
+            # vocabulary the prompt would have contained anyway.
+            refused = "Lady Margaret poisoned the sherry and Blackwood is covering for her"
+            core.observe("hunch", 0, refused, "inferred_by_model")
+            core.observe("premise", 0, "the decanter was tampered with", "assumed")
+
+            def fake_blocked_reveal(profile, prompt, model=None):
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "reveal", "cited": ["hunch", "premise"], "rule_out": None})
+                return "(voice reply)"
+
+            out = run_turn(core, neurotic, 0, "so who was it?", fake_blocked_reveal, mode=TWO_PASS)
+
+            # The checker did its job: the reveal was downgraded.
+            assert out.turn_log.move == moves.ABSTAIN
+            assert out.turn_log.missing, "a blocked reveal must name what was missing"
+
+            # The audit record keeps everything -- ids and the reason string.
+            assert any("hunch" in m for m in out.turn_log.missing)
+            assert any("premise" in m for m in out.turn_log.missing)
+            assert "hunch" in out.turn_log.reason
+
+            # ...and neither the audit record nor the voice prompt carries the
+            # refused sentence itself. The ledger already holds it under
+            # `hunch`; an auditor looks it up there.
+            voice_prompt = out.calls[-1].prompt
+            assert out.calls[-1].label == "voice"
+            for leaked in (refused, "poisoned", "sherry", "covering"):
+                assert leaked not in voice_prompt, f"refused claim leaked to the voice: {leaked!r}"
+                assert all(leaked not in m for m in out.turn_log.missing), f"checker copied {leaked!r}"
+            assert "tampered" not in voice_prompt, "an assumed premise's text leaked to the voice"
+
+            # The voice is told it is holding back, and told nothing else --
+            # not which entries failed, since a model-chosen entry id can be
+            # self-describing too.
+            assert _BLOCKED_VOICE_REASON in voice_prompt
+            assert "hunch" not in voice_prompt and "premise" not in voice_prompt
+
+            # A directly requested abstain was refused nothing, so it keeps its
+            # own reason -- the boundary must not flatten every abstain alike.
+            def fake_plain_abstain(profile, prompt, model=None):
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "abstain", "cited": [], "rule_out": None})
+                return "(voice reply)"
+
+            out2 = run_turn(core, neurotic, 1, "anything?", fake_plain_abstain, mode=TWO_PASS)
+            assert out2.turn_log.move == moves.ABSTAIN and not out2.turn_log.missing
+            assert "declining to conclude yet" in out2.calls[-1].prompt
+            assert _BLOCKED_VOICE_REASON not in out2.calls[-1].prompt
+
+            # A reveal the checker ALLOWED still reaches the voice with its own
+            # reason: this boundary withholds refused content, not all content.
+            core.observe("photo", 2, "photo shows the decanter unsealed", "observed_artifact")
+            core.observe("sound", 2, "the seal was broken before dinner", "inferred_by_model", supports=("photo",))
+
+            def fake_ok_reveal(profile, prompt, model=None):
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "reveal", "cited": ["sound"], "rule_out": None})
+                return "(voice reply)"
+
+            out3 = run_turn(core, neurotic, 2, "well?", fake_ok_reveal, mode=TWO_PASS)
+            assert out3.turn_log.move == moves.REVEAL
+            assert "sound" in out3.calls[-1].prompt, "an admissible reveal's own reason still reaches the voice"
 
     print("ok")
 
