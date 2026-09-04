@@ -395,7 +395,38 @@ def _self_check():
                 if "Propose up to" in prompt:
                     seen_ask_prompts.append(prompt)
                     seen_ask_options.append(profile.options())
+                    # narrator-euj: the winner sits in the MIDDLE on purpose.
+                    # SelectionLog.scored is in input order while `chosen` is
+                    # max-by-score, so a fixture with the winner at either end
+                    # cannot tell "picked the winner" from "picked position
+                    # 0" or "picked position -1" -- and `ask_text =
+                    # scored[0].text` passed the entire self-check. Three
+                    # candidates would still let "the first one that
+                    # discriminates" pass, so there are four: two uniform, a
+                    # weak 3-vs-1 splitter, and the clean 4-way winner third.
+                    # No positional or first-match shortcut satisfies it.
                     return json.dumps({"candidates": [
+                        {
+                            "id": "boring",
+                            "text": "What did you have for breakfast?",
+                            "predicted_answers": {
+                                "blackwood": "eggs", "margaret": "eggs",
+                                "ellis": "eggs", "jeeves": "eggs",
+                            },
+                        },
+                        {
+                            # Discriminates, but weakly: a 3-vs-1 split scores
+                            # 0.375 against whereabouts' clean 4-way 0.75.
+                            # Listed before the winner so "first candidate that
+                            # discriminates" is also wrong, not just "first
+                            # candidate".
+                            "id": "weak",
+                            "text": "Did you hear a door slam?",
+                            "predicted_answers": {
+                                "blackwood": "yes", "margaret": "no",
+                                "ellis": "no", "jeeves": "no",
+                            },
+                        },
                         {
                             "id": "whereabouts",
                             "text": "Where were you at the time of the murder?",
@@ -405,11 +436,11 @@ def _self_check():
                             },
                         },
                         {
-                            "id": "boring",
-                            "text": "What did you have for breakfast?",
+                            "id": "weather",
+                            "text": "Was it raining that evening?",
                             "predicted_answers": {
-                                "blackwood": "eggs", "margaret": "eggs",
-                                "ellis": "eggs", "jeeves": "eggs",
+                                "blackwood": "yes", "margaret": "yes",
+                                "ellis": "yes", "jeeves": "yes",
                             },
                         },
                     ]})
@@ -434,15 +465,29 @@ def _self_check():
             for hid in ("blackwood", "margaret", "ellis", "jeeves"):
                 assert hid in seen_ask_prompts[0]
 
-            # Every candidate is logged, and the discriminating one won.
+            # Every candidate is logged, and the discriminating one won --
+            # from second place in the input, so this distinguishes "picked
+            # the winner" from "picked the first one".
             assert out.question_log is not None
-            assert {s.id for s in out.question_log.scored} == {"whereabouts", "boring"}
+            assert [s.id for s in out.question_log.scored] == ["boring", "weak", "whereabouts", "weather"], (
+                "scored is in input order, and the winner is at neither end of it"
+            )
+            by_id = {s.id: s for s in out.question_log.scored}
+            assert by_id["weak"].discriminates and by_id["weak"].score < by_id["whereabouts"].score, (
+                "the fixture needs a second, weaker discriminator ahead of the winner"
+            )
             assert out.question_log.chosen == "whereabouts"
 
             # The winning question's text, not the board or the ledger, is
-            # what actually reaches the voice call.
+            # what actually reaches the voice call -- and the rejected one's
+            # text does not. The second half is what makes the first
+            # falsifiable: without it, handing the voice scored[0].text would
+            # still pass.
             voice_call = out.calls[2]
             assert "Where were you at the time of the murder?" in voice_call.prompt
+            for loser in ("What did you have for breakfast?", "Was it raining that evening?",
+                          "Did you hear a door slam?"):
+                assert loser not in voice_call.prompt, f"a rejected candidate reached the voice: {loser!r}"
 
             # Rule out every hypothesis but one candidate can't discriminate
             # between (blackwood vs. ellis) -- no candidate on offer splits
