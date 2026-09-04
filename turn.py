@@ -105,7 +105,10 @@ class TurnOutput:
     turn_log: "moves.TurnLog"  # noqa: F821 -- forward ref, moves imported lazily below
     ruled_out: tuple
     reply: str
-    question_log: "question_selector.SelectionLog | None" = None  # only set when this turn's move is "ask"
+    # Set whenever the reasoning channel asked to `ask`, including a turn the
+    # selector then declined (move downgraded to `abstain`) -- that log is the
+    # record of what was considered and why nothing won.
+    question_log: "question_selector.SelectionLog | None" = None
 
 
 def _ledger_summary(ledger):
@@ -203,6 +206,38 @@ def _ask_candidate_call(core, turn, generate_fn, model):
     return call, selection
 
 
+def _no_question_worth_asking(turn_log):
+    """Downgrade an `ask` the question selector found nothing for.
+
+    This is the shape `moves.choose_move` already applies to `reveal`: when
+    the checker for a move refuses it, the move becomes `abstain` and the
+    reason says why. `select_question` is the checker for `ask` -- it scores
+    every candidate against the live board and returns no winner when none
+    of them would actually narrow it -- so an ask it declined has to land
+    the same way. Left as `ask`, the voice call is told "you chose to ask"
+    with no question attached, and a persona asks whatever it likes: both
+    the generic turn-burning question `question_selector.py` opens by
+    condemning, and a reply the `SelectionLog` cannot account for.
+
+    `missing` stays empty. That field means evidence the *ledger* lacks --
+    it is what `_voice_prompt`'s blocked-reveal boundary keys on, and
+    nothing was refused for want of evidence here. What is missing is a
+    question worth a turn, and the reason says exactly that.
+
+    ponytail: once the board is down to one live hypothesis every candidate
+    scores 0 by construction (there is nothing left to split), so every ask
+    from then on lands here. That is the honest answer for this scorer --
+    but if the endgame should still ask confirming questions, the fix is a
+    reason to ask beyond discrimination, in question_selector, not a special
+    case here.
+    """
+    return moves.TurnLog(
+        turn_log.turn, moves.ABSTAIN,
+        "no candidate question would narrow the board, so this turn asks nothing",
+        cited=turn_log.cited,
+    )
+
+
 def _parse_decision(raw, require_reply):
     try:
         data = json.loads(raw)
@@ -250,17 +285,20 @@ def run_turn(core, persona, turn, user_message, generate_fn, model="qwen2.5-code
 
     question_log = None
     ask_text = None
-    if result.turn_log.move == moves.ASK:
+    turn_log = result.turn_log
+    if turn_log.move == moves.ASK:
         ask_call, question_log = _ask_candidate_call(core, turn, generate_fn, model)
         calls.append(ask_call)
         if question_log.chosen is not None:
             ask_text = next(s.text for s in question_log.scored if s.id == question_log.chosen)
+        else:
+            turn_log = _no_question_worth_asking(turn_log)
 
-    voice_prompt = _voice_prompt(result.turn_log, user_message, ask_text=ask_text)
+    voice_prompt = _voice_prompt(turn_log, user_message, ask_text=ask_text)
     reply_raw = generate_fn(persona, voice_prompt, model=model)
     calls.append(Call("voice", persona, persona.options(), voice_prompt, reply_raw))
 
-    return TurnOutput(mode, tuple(calls), result.turn_log, result.ruled_out, reply_raw.strip(), question_log)
+    return TurnOutput(mode, tuple(calls), turn_log, result.ruled_out, reply_raw.strip(), question_log)
 
 
 def _self_check():
@@ -430,10 +468,64 @@ def _self_check():
                     return json.dumps({"move": "ask", "cited": [], "rule_out": None})
                 return "(voice reply)"
 
+            # narrator-ncp: the selector declined, so the turn does not ask.
+            # The move lands as `abstain` -- the same downgrade moves.py
+            # applies to a reveal its checker refused -- rather than telling
+            # the voice "you chose to ask" and letting the persona invent a
+            # question nothing scored.
             out2 = run_turn(core, disciplined, 2, "well?", fake_ask_boring, mode=TWO_PASS)
-            assert out2.turn_log.move == moves.ASK
+            assert out2.turn_log.move == moves.ABSTAIN, "a declined ask must not stay an ask"
             assert out2.question_log.chosen is None
-            assert "specific question" not in out2.calls[-1].prompt
+            assert "asks nothing" in out2.turn_log.reason
+
+            # The voice is never instructed to ask on this turn, in any form.
+            voice2 = out2.calls[-1].prompt
+            assert "specific question" not in voice2
+            assert "chose to ask" not in voice2
+            assert "What did you have for breakfast?" not in voice2, (
+                "the rejected candidate's text must not reach the voice either"
+            )
+
+            # ...and the record of what was considered survives the downgrade:
+            # every candidate is still scored and logged, which is what makes
+            # "nothing was worth asking" auditable rather than merely asserted.
+            assert {c.id for c in out2.question_log.scored} == {"boring"}
+            assert out2.question_log.scored[0].discriminates is False
+
+            # This is a declined ask, not a blocked reveal: `missing` is empty,
+            # so narrator-7gj's boundary leaves the reason alone and the log
+            # says which of the two actually happened.
+            assert out2.turn_log.missing == ()
+            assert _BLOCKED_VOICE_REASON not in voice2
+
+            # The endgame, explicitly: narrow the board to ONE live hypothesis
+            # and every candidate scores 0 by construction -- with nothing left
+            # to split, _spread() is 1 - 1.0**2 for any predicted answer. This
+            # is the state a mystery converges to, so without the downgrade it
+            # is not an edge case but every remaining ask turn, each one handing
+            # the persona a free hand to invent a question.
+            core.observe("ellis_cleared", 2, "user: 'Dr. Ellis was on the night train'", "stated_by_user")
+            core.conclude(2, ["ellis_cleared"], moves.REVEAL, rule_out="ellis")
+            assert core.board.live_ids() == ["blackwood"], core.board.live_ids()
+
+            def fake_ask_endgame(profile, prompt, model=None):
+                if "Propose up to" in prompt:
+                    return json.dumps({"candidates": [
+                        {
+                            "id": "confirm",
+                            "text": "Was Lord Blackwood in the study?",
+                            "predicted_answers": {"blackwood": "yes"},
+                        },
+                    ]})
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "ask", "cited": [], "rule_out": None})
+                return "(voice reply)"
+
+            out3 = run_turn(core, disciplined, 3, "and?", fake_ask_endgame, mode=TWO_PASS)
+            assert out3.question_log.chosen is None, "one live hypothesis cannot be split"
+            assert out3.turn_log.move == moves.ABSTAIN
+            assert "chose to ask" not in out3.calls[-1].prompt
+            assert "Was Lord Blackwood in the study?" not in out3.calls[-1].prompt
 
             # A candidate generator that produces malformed JSON is a named
             # failure, same discipline as the reasoning channel's own parse.
