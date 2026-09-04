@@ -92,7 +92,12 @@ class HypothesisBoard:
         for hid in live:
             old = self._hyps[hid].weight
             new = raw[hid] / total
-            if abs(new - old) > 1e-12:
+            # Recorded whenever it actually changed. This used to skip changes
+            # under 1e-12 while still applying them -- the same hole rule_out
+            # had, just smaller: a weight the record cannot account for
+            # (narrator-eeb). An unchanged weight writes nothing, so a no-op
+            # reweight still leaves no entry.
+            if new != old:
                 self.history.append(BoardEvent(turn, "reweight", hid, old, new, reason))
             self._hyps[hid].weight = new
 
@@ -115,11 +120,26 @@ class HypothesisBoard:
         hyp.weight = 0.0
         self.history.append(BoardEvent(turn, "rule_out", hypothesis_id, old, 0.0, reason))
 
+        # Renormalizing the survivors is a weight change like any other, so it
+        # goes on the record like any other (narrator-eeb). Skipping it left
+        # dump()["history"] unable to reconstruct dump()["hypotheses"] after
+        # every single elimination, and the gap is not small: retiring a
+        # hypothesis that held most of the mass can lift a survivor from last
+        # place to board leader with nothing in the record attributing the move
+        # to anything. The reason names the rule_out that caused it, which is
+        # the entry immediately before these.
         remaining = self.live_ids()
         total = sum(self._hyps[hid].weight for hid in remaining)
         if total > 0:
             for hid in remaining:
-                self._hyps[hid].weight /= total
+                old_w = self._hyps[hid].weight
+                new_w = old_w / total
+                if new_w != old_w:
+                    self.history.append(BoardEvent(
+                        turn, "reweight", hid, old_w, new_w,
+                        f"renormalized after ruling out {hypothesis_id}",
+                    ))
+                self._hyps[hid].weight = new_w
 
     def dump(self):
         """Full board state plus the weight-shift history. A reversal shows
@@ -263,6 +283,86 @@ def _self_check():
     kinds = [e["kind"] for e in board.dump()["history"]]
     assert kinds.count("rule_out") == 3, "one rule_out per elimination, each with its own reason"
     assert kinds.count("reweight") > 0, "the two evidence turns must leave reweight events behind"
+
+    # --- narrator-eeb: the record has to reconstruct the board. ---
+    # This is the module's first stated rule -- "Every weight change is
+    # appended to history, never just applied in place" -- turned into
+    # something runnable rather than asserted in a docstring. rule_out used to
+    # renormalize the survivors silently, so replaying the record produced a
+    # board that summed to less than 1 with every survivor understated, on
+    # every single elimination.
+    def replay(dumped):
+        """Rebuild the board from its own history: uniform prior, then every
+        event applied in order.
+
+        Each event's `old_weight` is checked against the replayed state
+        *before* being applied, so a change that reached the board without
+        reaching the record surfaces at the next event touching that
+        hypothesis, instead of quietly absorbing into the final total.
+        """
+        n = len(dumped["hypotheses"])
+        weights = {h["id"]: 1.0 / n for h in dumped["hypotheses"]}
+        live = {h["id"]: True for h in dumped["hypotheses"]}
+        for e in dumped["history"]:
+            hid = e["hypothesis_id"]
+            assert e["old_weight"] == weights[hid], (
+                f"history gap on {hid}: the record replays to {weights[hid]}, "
+                f"but the next event says it was {e['old_weight']}"
+            )
+            weights[hid] = e["new_weight"]
+            if e["kind"] == "rule_out":
+                live[hid] = False
+        return weights, live
+
+    dumped = board.dump()
+    replayed_weights, replayed_live = replay(dumped)
+    for h in dumped["hypotheses"]:
+        assert replayed_weights[h["id"]] == h["weight"], (
+            f"{h['id']}: record replays to {replayed_weights[h['id']]}, board holds {h['weight']}"
+        )
+        assert replayed_live[h["id"]] == h["live"], f"{h['id']}: liveness diverged from the record"
+
+    # An elimination must leave the survivors' renormalization on the record,
+    # not just the retired hypothesis's own entry -- and it has to say which
+    # rule_out moved them, since a bare "reweight" next to an elimination is
+    # exactly the silent switch the dump exists to rule out.
+    fresh = HypothesisBoard([("a", "A"), ("b", "B"), ("c", "C")])
+    fresh.reweight(1, {"a": 0.9, "b": 0.05, "c": 0.05}, "early evidence for a")
+    before = {h["id"]: h["weight"] for h in fresh.dump()["hypotheses"]}
+    n_before = len(fresh.dump()["history"])
+    fresh.rule_out(2, "a", "user: 'definitely not A'")
+    new_events = fresh.dump()["history"][n_before:]
+    assert [e["kind"] for e in new_events] == ["rule_out", "reweight", "reweight"], new_events
+    assert all("ruling out a" in e["reason"] for e in new_events[1:]), new_events
+    # The move it records is not cosmetic: b goes from last place to leading.
+    after = {h["id"]: h["weight"] for h in fresh.dump()["hypotheses"]}
+    assert before["b"] == 0.05 and after["b"] == 0.5, (before, after)
+    w, lv = replay(fresh.dump())
+    for h in fresh.dump()["hypotheses"]:
+        assert w[h["id"]] == h["weight"] and lv[h["id"]] == h["live"]
+
+    # A move smaller than the 1e-12 that used to gate the record is still a
+    # move: it changes the board, so the record has to carry it or the two
+    # disagree from here on. Same hole rule_out had, at a scale that looks
+    # ignorable -- which is exactly why it was left in.
+    hair = HypothesisBoard([("a", "A"), ("b", "B"), ("c", "C")])
+    hair.reweight(1, {"a": 1.0, "b": 1.0, "c": 1.0 + 1e-12}, "a hair of evidence for c")
+    moved = [h for h in hair.dump()["hypotheses"] if h["weight"] != 1.0 / 3]
+    assert len(moved) == 3, "this fixture is meant to move every weight"
+    assert all(abs(h["weight"] - 1.0 / 3) < 1e-12 for h in moved), (
+        "...and to move each by less than the epsilon that used to gate the record"
+    )
+    assert len(hair.dump()["history"]) == 3, "every moved weight needs its own entry"
+    w, lv = replay(hair.dump())
+    for h in hair.dump()["hypotheses"]:
+        assert w[h["id"]] == h["weight"], f"{h['id']}: a sub-epsilon move left the record behind"
+
+    # The other half of the same rule: a reweight that changes nothing writes
+    # nothing. An entry claiming a move that never happened is the same kind
+    # of lie as a move with no entry, just pointing the other way.
+    quiet = HypothesisBoard([("a", "A"), ("b", "B"), ("c", "C")])
+    quiet.reweight(1, {"a": 1.0, "b": 1.0, "c": 1.0}, "evidence that favours nobody")
+    assert quiet.dump()["history"] == [], quiet.dump()["history"]
 
     print("ok")
 

@@ -116,10 +116,20 @@ def _self_check():
             assert set(core.board.live_ids()) == {"blackwood", "ellis", "jeeves"}
 
             # The board's own record shows *why*, and it traces back to a
-            # ledger citation, not a bare assertion.
-            last_event = core.board.dump()["history"][-1]
-            assert last_event["kind"] == "rule_out"
-            assert "strong_inference" in last_event["reason"]
+            # ledger citation, not a bare assertion. The elimination is no
+            # longer the last entry -- narrator-eeb made rule_out record the
+            # survivors' renormalization too -- so find it rather than
+            # assuming the board stopped moving when it fired.
+            history = core.board.dump()["history"]
+            rule_outs = [e for e in history if e["kind"] == "rule_out"]
+            assert len(rule_outs) == 1
+            assert "strong_inference" in rule_outs[-1]["reason"]
+
+            # ...and the weight the eliminated hypothesis shed is accounted
+            # for: the entries after it name the rule_out that moved them.
+            tail = history[history.index(rule_outs[-1]) + 1:]
+            assert tail, "ruling out margaret must leave the survivors' renormalization on the record"
+            assert all(e["kind"] == "reweight" and "ruling out margaret" in e["reason"] for e in tail), tail
 
             # A conclusion citing nothing the user has ever seen is
             # inadmissible even if it sounds confident.
