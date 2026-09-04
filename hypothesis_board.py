@@ -22,6 +22,7 @@ The two rules that keep this honest:
 """
 
 from dataclasses import dataclass
+from math import isfinite
 
 MIN_HYPOTHESES = 3
 MAX_HYPOTHESES = 5
@@ -76,6 +77,16 @@ class HypothesisBoard:
         hypotheses. This can push a hypothesis arbitrarily close to zero but
         never to it -- driving it out entirely is `rule_out`'s job, because
         that is the operation that has to justify itself with evidence.
+
+        That promise is about the *result*, so the result is what gets
+        checked (narrator-7z7). Validating only the supplied weights was not
+        enough: `inf` and `nan` both slip past `w <= 0` (each comparison is
+        False), and three finite, strictly-positive weights of 1e308 sum to
+        `inf`, which lands every live hypothesis on exactly 0.0 -- retiring
+        the whole board by arithmetic, the precise thing the guard's own
+        error message tells you to use `rule_out` for. Everything is checked
+        before anything is written, so a rejected reweight leaves the board
+        exactly as it found it.
         """
         if not reason:
             raise ValueError("reweight requires a reason citing the evidence")
@@ -84,14 +95,33 @@ class HypothesisBoard:
         if unknown:
             raise KeyError(f"not live hypotheses: {sorted(unknown)}")
         for hid, w in weights.items():
+            # isfinite first: `nan <= 0` is False, so the zero guard below
+            # would wave a nan straight through.
+            if not isfinite(w):
+                raise ValueError(f"reweight needs a finite weight for {hid!r}, got {w!r}")
             if w <= 0:
                 raise ValueError(f"reweight cannot zero out {hid!r}; rule it out with evidence instead")
 
         raw = {hid: weights.get(hid, self._hyps[hid].weight) for hid in live}
         total = sum(raw.values())
+        if not isfinite(total) or total <= 0:
+            raise ValueError(
+                f"reweight cannot normalize against a total of {total!r}; the weights "
+                "overflowed or cancelled"
+            )
+        fresh = {}
+        for hid in live:
+            w = raw[hid] / total
+            if not isfinite(w) or w <= 0:
+                raise ValueError(
+                    f"reweight would drive {hid!r} to {w!r}, retiring it by arithmetic; "
+                    "rule it out with evidence instead"
+                )
+            fresh[hid] = w
+
         for hid in live:
             old = self._hyps[hid].weight
-            new = raw[hid] / total
+            new = fresh[hid]
             # Recorded whenever it actually changed. This used to skip changes
             # under 1e-12 while still applying them -- the same hole rule_out
             # had, just smaller: a weight the record cannot account for
@@ -128,18 +158,26 @@ class HypothesisBoard:
         # place to board leader with nothing in the record attributing the move
         # to anything. The reason names the rule_out that caused it, which is
         # the entry immediately before these.
+        # `total` is a sum of strictly positive weights, so it is strictly
+        # positive: reweight now refuses any result at or below zero
+        # (narrator-7z7), and a float sum is never smaller than its largest
+        # addend. The `if total > 0:` this used to sit behind was there to
+        # survive a board already collapsed to zero, and its way of surviving
+        # was to skip renormalization -- leaving live hypotheses at 0.0 and
+        # the board silently broken. That state can no longer be built, and a
+        # loud ZeroDivisionError would beat a quiet wrong board if it ever
+        # could be again.
         remaining = self.live_ids()
         total = sum(self._hyps[hid].weight for hid in remaining)
-        if total > 0:
-            for hid in remaining:
-                old_w = self._hyps[hid].weight
-                new_w = old_w / total
-                if new_w != old_w:
-                    self.history.append(BoardEvent(
-                        turn, "reweight", hid, old_w, new_w,
-                        f"renormalized after ruling out {hypothesis_id}",
-                    ))
-                self._hyps[hid].weight = new_w
+        for hid in remaining:
+            old_w = self._hyps[hid].weight
+            new_w = old_w / total
+            if new_w != old_w:
+                self.history.append(BoardEvent(
+                    turn, "reweight", hid, old_w, new_w,
+                    f"renormalized after ruling out {hypothesis_id}",
+                ))
+            self._hyps[hid].weight = new_w
 
     def dump(self):
         """Full board state plus the weight-shift history. A reversal shows
@@ -356,6 +394,52 @@ def _self_check():
     w, lv = replay(hair.dump())
     for h in hair.dump()["hypotheses"]:
         assert w[h["id"]] == h["weight"], f"{h['id']}: a sub-epsilon move left the record behind"
+
+    # --- narrator-7z7: the "never to zero" promise is about the result. ---
+    # `w <= 0` guarded the inputs and nothing guarded the outputs, so finite,
+    # strictly-positive weights could still retire the whole board by
+    # arithmetic, and inf/nan walked straight past the guard (both
+    # comparisons are False). Each of these leaves the board untouched.
+    def rejects(weights, expect, why):
+        guarded = HypothesisBoard([("a", "A"), ("b", "B"), ("c", "C")])
+        guarded.reweight(1, {"a": 0.5, "b": 0.3, "c": 0.2}, "a real shift first")
+        before = {h["id"]: h["weight"] for h in guarded.dump()["hypotheses"]}
+        events = len(guarded.dump()["history"])
+        try:
+            guarded.reweight(2, weights, "should not land")
+        except ValueError as e:
+            assert expect in str(e), f"{why}: wrong message {str(e)!r}"
+        else:
+            raise AssertionError(f"{why} should have been rejected")
+        assert {h["id"]: h["weight"] for h in guarded.dump()["hypotheses"]} == before, (
+            f"{why}: a rejected reweight must leave the board exactly as it was")
+        assert len(guarded.dump()["history"]) == events, f"{why}: and must write no history"
+
+    inf, nan = float("inf"), float("nan")
+    rejects({"a": inf}, "finite weight", "an infinite weight")
+    rejects({"a": nan}, "finite weight", "a nan weight")
+    rejects({"a": -1.0}, "cannot zero out", "a negative weight")
+    rejects({"a": 0.0}, "cannot zero out", "a zero weight")
+    # Three finite, strictly-positive weights whose sum overflows to inf.
+    rejects({"a": 1e308, "b": 1e308, "c": 1e308}, "total of inf", "a sum that overflows")
+    # Finite weights, finite total, but a quotient that underflows to exactly
+    # 0.0 -- a hypothesis retired by division rather than by evidence.
+    rejects({"a": 1e-320, "b": 1e300, "c": 1e300}, "retiring it by arithmetic",
+            "a quotient that underflows to zero")
+    # Same, but the failure is the *second* hypothesis checked. Code that
+    # wrote as it validated would already have committed 'a' by then, so this
+    # is what makes the board-unchanged assertion above do real work.
+    rejects({"a": 1e300, "b": 1e-320, "c": 1e300}, "retiring it by arithmetic",
+            "a later hypothesis underflowing")
+
+    # And the states those used to produce are gone: no live hypothesis can
+    # end at 0.0 or nan through reweight, so rule_out's `total > 0` guard and
+    # question_selector's _spread never meet a collapsed board.
+    survivor = HypothesisBoard([("a", "A"), ("b", "B"), ("c", "C")])
+    survivor.reweight(1, {"a": 1e-12, "b": 1.0, "c": 1.0}, "a is all but excluded")
+    for h in survivor.dump()["hypotheses"]:
+        assert h["weight"] > 0.0 and isfinite(h["weight"]), h
+    assert abs(sum(h["weight"] for h in survivor.dump()["hypotheses"]) - 1.0) < 1e-9
 
     # The other half of the same rule: a reweight that changes nothing writes
     # nothing. An entry claiming a move that never happened is the same kind
