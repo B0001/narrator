@@ -117,11 +117,29 @@ class AlibiEngine:
         """Could a person seen in `room` at time `t` have done the killing?"""
         return can_reach(self.sim.spatial, room, self.sim.crime_scene, self.sim.murder_time - t)
 
-    def could_have_left_trace(self, room, t):
-        """...and then reached the room where the footprint was found."""
+    def could_have_left_trace(self, room, t, flee_room):
+        """...and then reached `flee_room`, where the footprint was found.
+
+        `flee_room` is a parameter because this is the one method on this
+        class the *checker* calls (narrator-jtv). It used to read the room
+        off `sim.trajectories[sim.culprit]`, which meant
+        `suspects_consistent_with_clues()` dereferenced the very answer it
+        exists to derive independently. The caller supplies it from the
+        published footprint clue instead.
+
+        Contrast `exonerating_sighting` below, which reads trajectories
+        freely and correctly: that one is only ever called from
+        `build_clues()`, on the producer's side of the line. The rule is not
+        "never touch ground truth", it is "the checker never touches it".
+        """
+        if not self.had_opportunity(room, t):
+            return False
+        if flee_room is None:
+            # No trace clue in this clue set: there is no flight to place, so
+            # opportunity is the whole test.
+            return True
         last = self.sim.time_steps - 1
-        flee_room = self.sim.trajectories[self.sim.culprit][last]
-        return self.had_opportunity(room, t) and can_reach(
+        return can_reach(
             self.sim.spatial, self.sim.crime_scene, flee_room, last - self.sim.murder_time)
 
     def exonerating_sighting(self, who):
@@ -217,16 +235,40 @@ class EpistemicClueGraph:
 
         return self.dag
 
+    def _flee_room_from_clues(self):
+        """Where the flight ended, read off the published trace clue.
+
+        The clue graph already carries this: `Clue_Footprint` is built with
+        `room=flee_room` and its description names the room out loud. Taking
+        it from here rather than from `sim.trajectories[sim.culprit]` is what
+        keeps the solver on the clue set (narrator-jtv).
+
+        `None` when this clue set holds no trace at all, which is the honest
+        answer rather than an error: `clue_partition._subgraph_view` hands
+        this checker arbitrary subsets, and a solver that has not been shown
+        the footprint has no flight to place. It is also what the old code
+        did on such a subset -- it read the real room off ground truth, and
+        `can_reach(crime_scene, flee_room, 1)` came back True -- so the
+        hidden-profile harness's results are preserved, not quietly moved.
+        """
+        traces = [d["room"] for _, d in self.dag.nodes(data=True) if d.get("kind") == "trace"]
+        if len(traces) > 1:
+            raise ValueError(f"expected at most one trace clue to locate the flight, got {len(traces)}")
+        return traces[0] if traces else None
+
     def suspects_consistent_with_clues(self):
         """Independent solver: who survives the clue set?
 
-        Deliberately reads only the clues and the cast — never sim.culprit. If
-        this returns anything but a single name, the mystery is unfair and the
-        generator is wrong, which is the whole point of checking it this way.
+        Reads only the clues and the cast — never sim.culprit, and never the
+        trajectories it could be recovered from. If this returns anything but
+        a single name, the mystery is unfair and the generator is wrong,
+        which is the whole point of checking it this way.
         """
+        flee_room = self._flee_room_from_clues()
         alibied = {
             d["who"] for _, d in self.dag.nodes(data=True)
-            if d.get("kind") == "alibi" and not self.engine.could_have_left_trace(d["room"], d["t"])
+            if d.get("kind") == "alibi"
+            and not self.engine.could_have_left_trace(d["room"], d["t"], flee_room)
         }
         return set(self.sim.suspects) - alibied
 
@@ -287,12 +329,16 @@ def _self_check():
         # as an alibi has to be one the geometry actually rules out, and the
         # culprit's own position must never produce one.
         engine = clues.engine
+        flee_room = clues._flee_room_from_clues()
+        assert flee_room == sim.trajectories[sim.culprit][sim.time_steps - 1], (
+            "the published trace clue must name the room the culprit actually fled to")
         for _, d in clues.dag.nodes(data=True):
             if d.get("kind") == "alibi":
-                assert not engine.could_have_left_trace(d["room"], d["t"]), (
+                assert not engine.could_have_left_trace(d["room"], d["t"], flee_room), (
                     f"seed {s}: {d['who']} seen in {d['room']} at t={d['t']} could still have done it")
         culprit_room = sim.trajectories[sim.culprit][sim.murder_time]
-        assert engine.could_have_left_trace(culprit_room, sim.murder_time), "the culprit must have had opportunity"
+        assert engine.could_have_left_trace(culprit_room, sim.murder_time, flee_room), (
+            "the culprit must have had opportunity")
         # The solver never sees sim.culprit; it must land on them anyway.
         assert clues.suspects_consistent_with_clues() == {sim.culprit}, (
             f"seed {s}: clues admit {clues.suspects_consistent_with_clues()}, culprit is {sim.culprit}")
@@ -308,6 +354,72 @@ def _self_check():
     clues.dag.remove_node(dropped)
     assert len(clues.suspects_consistent_with_clues()) == 2, "removing an alibi must widen the suspect set"
     assert not clues.validate_solvability(), "an under-clued mystery must not validate"
+
+    # --- narrator-jtv: the solver must not be able to read the answer. ---
+    # could_have_left_trace() used to fetch the flee room from
+    # sim.trajectories[sim.culprit], so suspects_consistent_with_clues() --
+    # the function whose entire job is to derive the culprit independently --
+    # dereferenced the culprit to do it.
+    #
+    # Output-equivalence cannot prove this fixed, and that is worth stating:
+    # the leak was inert. can_reach(crime_scene, flee_room, 1) is the same
+    # constant for every alibi clue, so it factored out of the comparison and
+    # the answer came out {culprit} whether it was True or False. A test that
+    # moved ground truth and checked the answer did not move would have passed
+    # against the broken code. So the proof is denial of access instead: run
+    # the solver against a sim that refuses the two attributes outright. This
+    # is the same standard chapters.py holds itself to for sim.culprit, made
+    # enforceable rather than promised.
+    class _NoGroundTruth:
+        FORBIDDEN = ("culprit", "trajectories", "causal")
+
+        def __init__(self, sim):
+            self._sim = sim
+
+        def __getattr__(self, name):
+            if name in _NoGroundTruth.FORBIDDEN:
+                raise AssertionError(f"the solver reached for ground truth: sim.{name}")
+            return getattr(self._sim, name)
+
+    for seed in range(20):
+        sim, clues = build(seed=seed)
+        blindfolded = EpistemicClueGraph(_NoGroundTruth(sim))
+        blindfolded.dag = clues.dag  # the published clue set, unchanged
+        assert blindfolded.suspects_consistent_with_clues() == {sim.culprit}, (
+            f"seed {seed}: the solver must land on the culprit from the clues alone")
+        assert blindfolded.validate_solvability()
+
+        # Exercise the far side of the short-circuit as well. Every alibi
+        # clue fails had_opportunity by construction -- that is what makes it
+        # an alibi -- so the checker on its own returns before reaching the
+        # can_reach branch, and a ground-truth read hiding there would never
+        # run under the guard. Someone standing in the crime scene at the
+        # murder time is the case that does reach it.
+        blind_engine = blindfolded.engine
+        assert blind_engine.could_have_left_trace(
+            sim.crime_scene, sim.murder_time, blindfolded._flee_room_from_clues())
+
+        # ...and with no trace clue in the set, that person is still not
+        # alibied. Returning False here instead would alibi everyone holding
+        # an alibi clue, which would let a solo agent who never saw the
+        # footprint "solve" the case -- collapsing the hidden-profile
+        # contract clue_partition.py is built to enforce.
+        assert blind_engine.could_have_left_trace(sim.crime_scene, sim.murder_time, None)
+
+    # The guard has to be able to fail, or it proves nothing: reaching for a
+    # forbidden attribute through it must raise.
+    probe = _NoGroundTruth(sim)
+    assert probe.crime_scene == sim.crime_scene, "the guard must pass observable state through"
+    # Named explicitly: an empty FORBIDDEN would make the loop below vacuous
+    # and the whole proof above would pass while guarding nothing.
+    assert set(_NoGroundTruth.FORBIDDEN) >= {"culprit", "trajectories"}
+    for forbidden in _NoGroundTruth.FORBIDDEN:
+        try:
+            getattr(probe, forbidden)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"the ground-truth guard failed to catch sim.{forbidden}")
 
     print("ok")
 
