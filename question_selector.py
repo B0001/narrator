@@ -39,7 +39,20 @@ more thing, not several.
 import json
 from dataclasses import dataclass
 
-_EPS = 1e-9
+# A question earns its turn only if enough of the board's belief actually sits
+# behind a differing answer. This floor is stated in belief units -- the share
+# of live weight held by every hypothesis that does *not* give the majority
+# answer -- rather than as a threshold on the Gini score, because a Gini value
+# is not a quantity a reader can judge and a fraction of the board is: 1e-3 is
+# "a tenth of a percent". An epsilon on the score instead would be doing two
+# unrelated jobs at once, guarding float noise and deciding what is worth
+# asking, and would set the second by accident: for a two-way split Gini is
+# ~2x the minority fraction, so a 1e-9 score floor rejects only a minority mass
+# below ~5e-10 while calling every board above that worth a turn.
+# ponytail: one flat repo-wide floor, no per-board calibration. If a scenario
+# ever needs the selector to chase a long shot, make this a select_question()
+# argument rather than a second constant here.
+_MIN_MINORITY_MASS = 1e-3
 
 
 @dataclass
@@ -89,6 +102,18 @@ def _spread(live_weights, predicted_answers):
     return 1.0 - sum((mass / total) ** 2 for mass in groups.values()), groups
 
 
+def _minority_mass(groups):
+    """Share of live board weight held by every hypothesis that does *not*
+    give the single most-believed predicted answer.
+
+    0.0 exactly when they all agree. This is the quantity that says whether a
+    question is worth a turn: not how many distinct answers exist, but how
+    much belief actually rides on the difference.
+    """
+    total = sum(groups.values())
+    return 1.0 - max(groups.values()) / total
+
+
 def score_candidate(board, candidate):
     """Score one candidate question against the board's live hypotheses.
 
@@ -98,11 +123,29 @@ def score_candidate(board, candidate):
     """
     live_weights = _live_weights(board)
     spread, groups = _spread(live_weights, candidate.predicted_answers)
-    discriminates = spread > _EPS
-    if not discriminates:
-        (only_answer,) = groups.keys()
+    minority = _minority_mass(groups)
+
+    if len(groups) == 1:
+        # Uninformative regardless of who is right: nobody answers differently.
+        (only_answer,) = groups
+        discriminates = False
         reason = f"every live hypothesis predicts the same answer ({only_answer!r}); spread=0.0"
+    elif minority <= _MIN_MINORITY_MASS:
+        # A split on paper only. The hypotheses that would answer differently
+        # are ones the board has already all but abandoned, so the answer moves
+        # essentially no belief -- same practical outcome as a uniform question,
+        # said honestly rather than by pretending there was only one answer.
+        # This is also the branch that keeps the single-answer unpack above
+        # from being reached with several groups (narrator-n0x).
+        discriminates = False
+        reason = (
+            f"nominally splits live hypotheses into {len(groups)} answer groups, but only "
+            f"{minority:.3e} of the board's belief sits behind a differing answer "
+            f"(floor {_MIN_MINORITY_MASS:g}): every hypothesis that would answer differently "
+            f"is already all but ruled out; spread={spread:.3e}"
+        )
     else:
+        discriminates = True
         by_mass = sorted(groups.items(), key=lambda kv: -kv[1])
         breakdown = ", ".join(f"{answer!r} ({mass:.2f})" for answer, mass in by_mass)
         reason = f"splits live hypotheses into {len(groups)} answer groups: {breakdown}; spread={spread:.4f}"
@@ -362,6 +405,55 @@ def _self_check():
         assert "did not return JSON" in str(e)
     else:
         raise AssertionError("non-JSON candidate-generator output should have been rejected")
+
+    # --- narrator-n0x: a lopsided board. `reweight` refuses only w <= 0, so a
+    # live hypothesis can carry arbitrarily small positive mass while two
+    # genuinely distinct predicted answers exist. The scorer used to assume
+    # "not discriminating" meant "exactly one answer group" and died with
+    # ValueError: too many values to unpack. It must report the honest
+    # outcome instead -- uninformative, because everyone who would answer
+    # differently is already all but ruled out -- and still return a log. ---
+    def lopsided_board(c_weight):
+        b = HypothesisBoard([("a", "A did it"), ("b", "B did it"), ("c", "C did it")])
+        b.reweight(1, {"a": 1.0, "b": 1.0, "c": c_weight}, "c is all but excluded")
+        return b
+
+    only_c_differs = Candidate(
+        "hairline", "Did you notice the hairline crack in the vase?",
+        {"a": "no", "b": "no", "c": "yes"},
+    )
+    log6 = select_question(lopsided_board(1e-12), 7, [only_c_differs])
+    assert isinstance(log6, SelectionLog), "a lopsided board must yield a log, not a raise"
+    assert log6.chosen is None, "a split nobody has weight behind cannot win"
+    (scored6,) = log6.scored
+    assert scored6.discriminates is False
+    assert "2 answer groups" in scored6.reason and "already all but ruled out" in scored6.reason
+    assert scored6.score > 0.0, "the real spread is still reported, not flattened to 0"
+
+    # The floor has to be doing real work, not passing because the case above
+    # picked an absurd constant. At c=1e-4 the minority mass is ~5e-5: still
+    # nothing worth a turn, but ~5 orders of magnitude above where a
+    # float-noise epsilon on the Gini score would have sat, so this case
+    # abstains only because the gate is stated in belief units. If the gate
+    # ever reverts to `spread > 1e-9`, this assertion is what fails.
+    faint = select_question(lopsided_board(1e-4), 8, [only_c_differs])
+    assert faint.chosen is None, "a 5e-5 minority is a split on paper, not one worth asking about"
+    assert faint.scored[0].score > 1e-9, "...and it is not float noise that rejected it"
+
+    # ...and the floor must not swallow a real long shot. c=0.05 relative is a
+    # hypothesis the board has demoted but not abandoned; a question only it
+    # answers differently is exactly Columbo's one-more-thing.
+    longshot = select_question(lopsided_board(0.05), 9, [only_c_differs])
+    assert longshot.chosen == "hairline", "a live minority still deserves the turn"
+    assert longshot.scored[0].discriminates is True
+
+    # The genuinely-uniform case keeps its own distinct explanation -- the two
+    # rejections must not collapse into one vague "uninformative".
+    (uniform6,) = select_question(
+        lopsided_board(1e-12), 10, [Candidate("u", "", {"a": "x", "b": "x", "c": "x"})]
+    ).scored
+    assert uniform6.score == 0.0 and "every live hypothesis predicts the same answer" in uniform6.reason
+    assert "answer groups" not in uniform6.reason
 
     print("ok")
 
