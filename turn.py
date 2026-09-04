@@ -543,6 +543,41 @@ def _self_check():
             else:
                 raise AssertionError("a candidate generator returning non-JSON should have been rejected")
 
+            # narrator-fdp: the other shapes of drift reach run_turn the same
+            # way and must land the same way. Each of these used to escape as
+            # TypeError, KeyError or AttributeError -- aborting the turn with
+            # no reply and no logged abstention, from three frames inside
+            # select_question rather than at the boundary that parses them.
+            def ask_returning(candidates):
+                def fake(profile, prompt, model=None):
+                    if "Propose up to" in prompt:
+                        return json.dumps({"candidates": candidates})
+                    if isinstance(profile, ReasoningProfile):
+                        return json.dumps({"move": "ask", "cited": [], "rule_out": None})
+                    return "(voice reply)"
+                return fake
+
+            drift = [
+                # A hedged answer: valid JSON, unhashable, used to die on a dict update.
+                ([{"id": "q", "text": "where?", "predicted_answers": {"blackwood": ["study", "library"]}}],
+                 "cannot be compared"),
+                # Two candidates sharing an id: the log could not name its winner.
+                ([{"id": "q1", "text": "one?", "predicted_answers": {"blackwood": "a"}},
+                  {"id": "q1", "text": "two?", "predicted_answers": {"blackwood": "b"}}],
+                 "repeated the id"),
+                # Drifted key names, and a bare string where an object belongs.
+                ([{"question": "q", "text": "t", "predicted_answers": {"blackwood": "a"}}],
+                 "non-empty 'id'"),
+                (["just a string"], "not an object"),
+            ]
+            for candidates, expect in drift:
+                try:
+                    run_turn(core, disciplined, 3, "?", ask_returning(candidates), mode=TWO_PASS)
+                except ValueError as e:
+                    assert expect in str(e), f"wrong message for {candidates!r}: {e}"
+                else:
+                    raise AssertionError(f"candidate drift {candidates!r} should have been rejected")
+
     # --- single_pass: persona options reach the one call that both decides
     # and speaks -- this is the mode the bead keeps around so the difference
     # from two_pass is something a learner can actually see, not just read. ---

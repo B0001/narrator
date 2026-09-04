@@ -82,6 +82,22 @@ def _live_weights(board):
     return {h["id"]: h["weight"] for h in board.dump()["hypotheses"] if h["live"]}
 
 
+def _as_group_key(hid, answer):
+    """Predicted answers become dict keys in `_spread`, so they have to be
+    hashable. A model hedging with a JSON array (`"blackwood": ["study",
+    "library"]`) or an object is perfectly valid JSON and ordinary schema
+    drift, so it earns a named `ValueError` here rather than a `TypeError`
+    raised three frames down inside a dict update (narrator-fdp).
+    """
+    try:
+        hash(answer)
+    except TypeError as e:
+        raise ValueError(
+            f"predicted answer for {hid!r} cannot be compared to other answers: {answer!r}"
+        ) from e
+    return answer
+
+
 def _spread(live_weights, predicted_answers):
     """Weighted Gini impurity of predicted answers over live hypotheses.
 
@@ -96,7 +112,7 @@ def _spread(live_weights, predicted_answers):
 
     groups = {}
     for hid, w in live_weights.items():
-        answer = predicted_answers[hid]
+        answer = _as_group_key(hid, predicted_answers[hid])
         groups[answer] = groups.get(answer, 0.0) + w
     total = sum(groups.values())
     return 1.0 - sum((mass / total) ** 2 for mass in groups.values()), groups
@@ -164,6 +180,14 @@ def select_question(board, turn, candidates):
     """
     if not candidates:
         raise ValueError("no candidate questions to select from")
+    ids = [c.id for c in candidates]
+    if len(set(ids)) != len(ids):
+        # `chosen` below is a bare id, so two candidates sharing one makes the
+        # log ambiguous: a caller looking the winner back up by id can get the
+        # other one, and would ask a question this function rejected while the
+        # log reports the one it picked (narrator-fdp). Same uniqueness rule
+        # evidence_ledger and hypothesis_board already apply to their own ids.
+        raise ValueError(f"candidate ids must be unique, got {ids}")
 
     scored = tuple(score_candidate(board, c) for c in candidates)
     winners = [s for s in scored if s.discriminates]
@@ -194,7 +218,7 @@ def candidate_prompt(board, n=3):
         "it were true, would predict the answer to be.\n\n"
         f"Live hypotheses:\n{lines}\n\n"
         "Return JSON only, no other text: "
-        '{"candidates": [{"id": "<short id>", "text": "<question>", '
+        '{"candidates": [{"id": "<short id, unique across these candidates>", "text": "<question>", '
         '"predicted_answers": {"<hypothesis id>": "<predicted answer>", '
         "... one entry per live hypothesis id listed above}}]}"
     )
@@ -203,10 +227,20 @@ def candidate_prompt(board, n=3):
 def parse_candidates(board, raw):
     """Parse the candidate-generation call's raw output into `Candidate`s.
 
-    Checks the same completeness rule `score_candidate` enforces --
-    every live hypothesis needs a predicted answer -- but here, so a
-    malformed or lazy model response is a named `ValueError` at the source,
-    not a `KeyError` raised later, deep inside `select_question`.
+    This is the module's trust boundary: the one place raw model output
+    becomes `Candidate`s for every caller. Everything it declines to check
+    here surfaces later as some other exception from deeper in, which is the
+    failure this function exists to prevent -- so a malformed or lazy
+    response is a named `ValueError` naming the generator, never a
+    `KeyError`, `AttributeError` or `TypeError` from inside
+    `select_question` (narrator-fdp).
+
+    Checked, in order: the payload is JSON with a non-empty `candidates`
+    list; each entry is an object with a non-blank string `id` and `text`;
+    ids are unique, because `SelectionLog.chosen` is a bare id and cannot
+    name one of two candidates sharing it; `predicted_answers` is an object
+    covering every live hypothesis; and each predicted answer is hashable,
+    since `_spread` groups by it.
     """
     try:
         data = json.loads(raw)
@@ -214,19 +248,37 @@ def parse_candidates(board, raw):
         raise ValueError(f"candidate generator did not return JSON: {raw!r}") from e
 
     raw_candidates = data.get("candidates") if isinstance(data, dict) else None
-    if not raw_candidates:
+    if not isinstance(raw_candidates, list) or not raw_candidates:
         raise ValueError(f"candidate generator returned no candidates: {raw!r}")
 
     live_ids = {h["id"] for h in board.dump()["hypotheses"] if h["live"]}
     candidates = []
+    seen = set()
     for c in raw_candidates:
-        predicted = c.get("predicted_answers", {})
+        if not isinstance(c, dict):
+            raise ValueError(f"candidate is not an object: {c!r}")
+        for field in ("id", "text"):
+            value = c.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"candidate needs a non-empty {field!r}, got {value!r}")
+        cid = c["id"]
+        if cid in seen:
+            raise ValueError(
+                f"candidate generator repeated the id {cid!r}; ids must be unique, "
+                "since the selection log names its winner by id"
+            )
+        seen.add(cid)
+
+        predicted = c.get("predicted_answers")
+        if not isinstance(predicted, dict):
+            raise ValueError(f"candidate {cid!r} needs a predicted_answers object, got {predicted!r}")
         missing = sorted(live_ids - set(predicted))
         if missing:
             raise ValueError(
-                f"candidate {c.get('id')!r} missing predictions for live hypotheses: {missing}"
+                f"candidate {cid!r} missing predictions for live hypotheses: {missing}"
             )
-        candidates.append(Candidate(c["id"], c["text"], {hid: predicted[hid] for hid in live_ids}))
+        answers = {hid: _as_group_key(hid, predicted[hid]) for hid in live_ids}
+        candidates.append(Candidate(cid, c["text"], answers))
     return tuple(candidates)
 
 
@@ -405,6 +457,82 @@ def _self_check():
         assert "did not return JSON" in str(e)
     else:
         raise AssertionError("non-JSON candidate-generator output should have been rejected")
+
+    # --- narrator-fdp: this function is the module's trust boundary, so every
+    # shape of drift it lets through becomes some other exception from deeper
+    # in. Each of these used to escape as KeyError, AttributeError or
+    # TypeError; all must be a named ValueError naming the generator. ---
+    live_now = sorted(board.live_ids())  # blackwood, ellis, margaret
+
+    def payload(**over):
+        c = {"id": "q", "text": "a question?",
+             "predicted_answers": {hid: "same" for hid in live_now}}
+        c.update(over)
+        return json.dumps({"candidates": [c]})
+
+    def rejects(raw, expect, why):
+        try:
+            parse_candidates(board, raw)
+        except ValueError as e:
+            assert expect in str(e), f"{why}: wrong message {str(e)!r}"
+        else:
+            raise AssertionError(f"{why} should have been rejected")
+
+    # A model hedging with a list or object is valid JSON and ordinary drift.
+    # It used to reach _spread and die on `groups[answer]` as an unhashable
+    # dict key, aborting the whole turn with no reply and no abstention.
+    hedged = dict.fromkeys(live_now, "same")
+    hedged[live_now[0]] = ["study", "library"]
+    rejects(payload(predicted_answers=hedged), "cannot be compared", "a list-valued prediction")
+    hedged[live_now[0]] = {"maybe": "study"}
+    rejects(payload(predicted_answers=hedged), "cannot be compared", "an object-valued prediction")
+
+    # Drifted or missing key names: hard-indexed c["id"] / c["text"] raised
+    # KeyError, and a bare string in the list raised AttributeError on .get.
+    rejects(json.dumps({"candidates": [{"question": "q", "text": "t",
+                                        "predicted_answers": dict.fromkeys(live_now, "x")}]}),
+            "non-empty 'id'", "a candidate with a drifted id key")
+    rejects(payload(text="   "), "non-empty 'text'", "a blank question")
+    rejects(payload(id=None), "non-empty 'id'", "a null id")
+    rejects(json.dumps({"candidates": ["just a string"]}), "not an object", "a bare string candidate")
+    rejects(payload(predicted_answers="not an object"), "predicted_answers object",
+            "a non-object predicted_answers")
+
+    # Duplicate ids: SelectionLog.chosen is a bare id, so two candidates
+    # sharing one make the log unable to name its own winner. A generator
+    # emitting generic q1/q2 ids is exactly how this arrives.
+    dup = json.dumps({"candidates": [
+        {"id": "q1", "text": "boring?", "predicted_answers": dict.fromkeys(live_now, "same")},
+        {"id": "q1", "text": "splitting?", "predicted_answers": {
+            hid: hid for hid in live_now}},
+    ]})
+    rejects(dup, "repeated the id", "a repeated candidate id")
+
+    # ...and select_question enforces the same rule itself, because it is
+    # callable with hand-built Candidates that never passed through parse --
+    # its own return value is what goes ambiguous.
+    twins = [Candidate("q1", "boring?", dict.fromkeys(live_now, "same")),
+             Candidate("q1", "splitting?", {hid: hid for hid in live_now})]
+    try:
+        select_question(board, 11, twins)
+    except ValueError as e:
+        assert "unique" in str(e)
+    else:
+        raise AssertionError("select_question must refuse candidates it cannot name a winner among")
+
+    # Same for an unhashable answer arriving by the hand-built route: a named
+    # ValueError from the scorer, not a TypeError from a dict update.
+    try:
+        select_question(board, 12, [Candidate("q", "?", {**dict.fromkeys(live_now, "x"),
+                                                         live_now[0]: ["a", "b"]})])
+    except ValueError as e:
+        assert "cannot be compared" in str(e)
+    else:
+        raise AssertionError("an unhashable predicted answer should have been rejected")
+
+    # The prompt now states the uniqueness rule, rather than only punishing
+    # its absence after the fact.
+    assert "unique" in candidate_prompt(board)
 
     # --- narrator-n0x: a lopsided board. `reweight` refuses only w <= 0, so a
     # live hypothesis can carry arbitrarily small positive mass while two
