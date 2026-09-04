@@ -3,20 +3,31 @@
 Turn share, agreement rate, and who concedes — read straight off the JSONL log
 so a trait pairing can be compared against another one without rereading it.
 
-`narrator-c5b.3.7` adds the chat side: abstention rate, how often a chosen
-question was followed by the board actually narrowing, and the age of ledger
-entries nobody ever cited. Both kinds of log are JSONL and both load through
-`agents.load_transcript`; which one a file is gets sniffed from its first
-record, since a chat row has a `move` and a debate row has a `speaker`.
+`narrator-c5b.3.7` adds the chat side: abstention rate, what the question
+selector actually produced and whether the user answered it, and the age of
+ledger entries nobody ever used. The repo writes three JSONL formats and
+`log_kind` names which one it was handed -- a chat row has a `move`, a debate
+row a `speaker`, a ledger row a `provenance` -- so pointing the CLI at the
+ledger sitting next to a chat log says so instead of failing on a missing
+field.
 
 The chat numbers are meant to be argued with, which is why each is reported
-next to its raw counts rather than as a bare rate. The second one especially:
-`select_question` scores a candidate on how far the *live hypotheses'
-predicted answers* diverge, which is a claim about the board, not a
-prediction about the user. Comparing mean predicted spread against how often
-the board then moved is the whole point — a high spread and a low landing
-rate is the selector being right about the hypotheses and wrong about the
-conversation.
+next to its raw counts rather than as a bare rate.
+
+One measure is deliberately absent. The bead asked how often a chosen
+question "actually split the board", and that is not recoverable from this
+log: the board narrows only via `rule_out`, which `chat_core.conclude` calls
+only on a reveal that passed admissibility, and nothing links a reveal's
+citations back to a question asked earlier. A first version of this module
+scored "the live set was smaller by the next turn" and called that the
+question landing -- it was measuring whether the following turn happened to
+be a successful reveal, on evidence that could predate the question
+entirely, and it was capped at (live-1) landings per conversation no matter
+how good the questions were. What is honestly measurable is how often the
+selector found a question worth asking at all, and whether new
+`stated_by_user` evidence arrived on the turn after it did. Closing the gap
+needs the log to record which evidence answered which question --
+`narrator-c5b.3.6`'s Chekhov ledger territory, filed as its own bead.
 
     python3 metrics.py                        # self-check
     python3 metrics.py scarce_resource.jsonl  # debate summary table
@@ -149,10 +160,12 @@ def chat_record(out, live_ids, ledger):
     """One turn of a C5 chat as a JSONL-ready row.
 
     `live_ids` is the board's live hypotheses after the turn, and `ledger`
-    maps every entry id to its `supports` tuple -- build it with
-    `{e.id: e.supports for e in core.ledger.entries()}`. The supports are
-    what let an entry count as used when it grounds a cited inference rather
-    than being cited itself.
+    maps every entry id to its entry -- build it with
+    `{e.id: e for e in core.ledger.entries()}`. Both fields are recorded and
+    both are load-bearing: `supports` lets an entry count as used when it
+    grounds a cited inference rather than being cited itself, and
+    `provenance` is how new `stated_by_user` evidence on the next turn is
+    recognised as the user answering the question this turn asked.
 
     Recording the full sets each turn rather than the deltas means the log
     reconstructs its own history: an entry's introduction turn is the first
@@ -175,43 +188,74 @@ def chat_record(out, live_ids, ledger):
         "cited": list(out.turn_log.cited),
         "ruled_out": list(out.ruled_out),
         "live": list(live_ids),
-        "ledger": {eid: list(sup) for eid, sup in dict(ledger).items()},
+        "ledger": {
+            eid: {"supports": list(e.supports), "provenance": e.provenance}
+            for eid, e in dict(ledger).items()
+        },
         "question": question,
         "reply": out.reply,
     }
 
 
+# The three JSONL formats this repo writes, in the order they are tested for.
+# Positive identification of each, rather than "chat, else debate": a
+# ChatCore run leaves its evidence ledger in the same directory as its chat
+# log, so the ledger is the likeliest wrong file to be handed, and falling
+# through to the debate path made that a bare KeyError: 'speaker'.
+_LOG_KINDS = (("move", "chat"), ("speaker", "debate"), ("provenance", "ledger"))
+
+
+def log_kind(records):
+    """Which format this is -- "chat", "debate", "ledger", or None."""
+    if not records:
+        return None
+    return next((kind for field, kind in _LOG_KINDS if field in records[0]), None)
+
+
 def is_chat_log(records):
-    """A chat row has a `move`; a debate row has a `speaker`."""
-    return bool(records) and "move" in records[0]
+    return log_kind(records) == "chat"
 
 
 def unresolved_threads(records):
-    """Ledger entries introduced and never cited, with their age in turns.
+    """Ledger entries introduced and never used, with their age in turns.
 
     Chekhov's rule as a number: a claim put on the record and never used
-    again is a gun on the mantel that never goes off. Age is turns between
-    the row an entry first appears in and the last row of the log, so it
-    grows for as long as the entry stays unused.
+    again is a gun on the mantel that never goes off. Age is the highest turn
+    in the log minus the turn the entry first appears on, so it grows for as
+    long as the entry stays unused.
 
-    An entry counts as used if it was cited, or if it grounds something that
-    was -- the same recursion `admissibility._grounded` walks. Without that,
+    An entry counts as used if it was cited on a turn that concluded
+    something, or if it grounds something that was -- the same recursion
+    `admissibility._grounded` walks. The transitive half matters: without it,
     a photograph cited only through the inference it supports would read as
-    an abandoned thread, which is the opposite of what happened to it.
+    an abandoned thread, the opposite of what happened to it.
 
-    ponytail: citation is the only notion of resolution available here,
-    because it is the only one the turn log carries. An entry answered in
-    prose but never cited still reads as unresolved. narrator-c5b.3.6's
-    Chekhov ledger is where a richer definition belongs; when it lands, this
-    should read that instead of re-deriving it.
+    Citations on an *abstained* turn are not uses. `moves.choose_move` keeps
+    the refused ids on the TurnLog when admissibility downgrades a reveal, so
+    counting them would mark an inference the checker **rejected** as
+    resolved -- and since the mark is transitive, everything supporting it
+    too. An ungrounded claim the checker refused and nobody ever grounded is
+    the purest case of the gun left on the mantel, so it is the one case this
+    must not delete. A directly requested abstain concluded nothing either,
+    and is treated the same way.
+
+    ponytail: citation is the only notion of use available here, because it
+    is the only one the turn log carries. An entry answered in prose but
+    never cited still reads as unresolved. narrator-c5b.3.6's Chekhov ledger
+    is where a richer definition belongs; when it lands, this should read
+    that instead of re-deriving it.
     """
+    if not records:
+        raise ValueError("empty chat log: nothing to measure")
+
     supports, introduced = {}, {}
     for r in records:
-        for eid, sup in (r.get("ledger") or {}).items():
-            supports.setdefault(eid, list(sup))
+        for eid, meta in (r.get("ledger") or {}).items():
+            supports.setdefault(eid, list(meta.get("supports", ())))
             introduced.setdefault(eid, r["turn"])
 
-    used, stack = set(), [c for r in records for c in r.get("cited", ())]
+    used = set()
+    stack = [c for r in records if r.get("move") != ABSTAIN for c in r.get("cited", ())]
     while stack:
         eid = stack.pop()
         if eid in used:
@@ -219,47 +263,65 @@ def unresolved_threads(records):
         used.add(eid)
         stack.extend(supports.get(eid, ()))
 
-    last = records[-1]["turn"]
+    # max, not records[-1]: a log that is not turn-monotonic (resumed, merged,
+    # re-sorted) would otherwise produce negative ages.
+    last = max(r["turn"] for r in records)
     return {eid: last - t for eid, t in introduced.items() if eid not in used}
 
 
 def chat_metrics(records):
-    """Abstention rate, question landing rate, and unresolved-thread ages."""
+    """Abstention rate, what the question selector produced and whether the
+    user answered it, and unresolved-thread ages."""
     if not records:
         raise ValueError("empty chat log: nothing to measure")
-    if not is_chat_log(records):
-        raise ValueError("not a chat log: rows have no 'move' (is this a debate transcript?)")
+    kind = log_kind(records)
+    if kind != "chat":
+        named = {"debate": "an agents.py debate transcript",
+                 "ledger": "an evidence_ledger.py ledger"}.get(kind, "an unrecognised format")
+        raise ValueError(f"not a chat log: rows have no 'move' -- this looks like {named}")
 
     moves = [r["move"] for r in records]
     abstained = sum(m == ABSTAIN for m in moves)
 
-    # A question "landed" when the board was smaller by the next recorded
-    # turn. Deliberately a one-turn window: crediting a question with any
-    # later narrowing would credit it with evidence that arrived for other
-    # reasons. The strictness is the point, and it is why the mean predicted
-    # spread is reported beside it.
-    chosen = []
-    for i, r in enumerate(records):
-        q = r.get("question") or {}
+    # Two things about questions are honestly in this log. First, yield: a
+    # `question` block exists on every turn the reasoning channel asked, and
+    # `chosen` is None on the ones where the selector found nothing worth
+    # asking, so the ratio is the selector's own hit rate. Second, whether
+    # the user answered: new `stated_by_user` evidence on the following turn
+    # is the observable trace of an answer reaching the record.
+    #
+    # Whether the answer *split the board* is not in here -- see the module
+    # docstring. The board narrows only on a reveal that passed
+    # admissibility, and nothing ties a reveal's citations to an earlier
+    # question, so any such number would be measuring the next turn's move.
+    asked = [i for i, r in enumerate(records) if r.get("question") is not None]
+    chosen, answered, spreads = [], 0, []
+    for i in asked:
+        q = records[i]["question"]
         if not q.get("chosen"):
             continue
-        scored = {s["id"]: s for s in q.get("scored", ())}
-        landed = (
-            i + 1 < len(records)
-            and len(records[i + 1]["live"]) < len(r["live"])
-        )
-        chosen.append((scored.get(q["chosen"], {}).get("score"), landed))
+        chosen.append(q["chosen"])
+        score = next((c["score"] for c in q.get("scored", ()) if c["id"] == q["chosen"]), None)
+        if score is not None:
+            spreads.append(score)
+        if i + 1 < len(records):
+            before = set(records[i].get("ledger") or {})
+            after = (records[i + 1].get("ledger") or {}).items()
+            if any(eid not in before and meta.get("provenance") == "stated_by_user"
+                   for eid, meta in after):
+                answered += 1
 
-    spreads = [s for s, _ in chosen if s is not None]
     ages = unresolved_threads(records)
     return {
         "turns": len(records),
         "moves": {m: moves.count(m) for m in dict.fromkeys(moves)},
         "abstentions": abstained,
         "abstention_rate": abstained / len(records),
+        "asked": len(asked),
         "questions_chosen": len(chosen),
-        "questions_landed": sum(landed for _, landed in chosen),
-        "landing_rate": (sum(landed for _, landed in chosen) / len(chosen)) if chosen else None,
+        "question_yield": (len(chosen) / len(asked)) if asked else None,
+        "questions_answered": answered,
+        "answer_rate": (answered / len(chosen)) if chosen else None,
         "mean_predicted_spread": (sum(spreads) / len(spreads)) if spreads else None,
         "unresolved": ages,
         "oldest_unresolved": max(ages.values()) if ages else None,
@@ -290,9 +352,11 @@ def chat_summary(records):
         f"{'moves':<24}  {moves}",
         "-" * 60,
         f"{'abstention rate':<24}  {_rate(m['abstention_rate'])}  ({m['abstentions']}/{m['turns']} turns)",
-        f"{'questions chosen':<24}  {m['questions_chosen']}",
-        f"{'  board narrowed after':<24}  {_rate(m['landing_rate'])}  "
-        f"({m['questions_landed']}/{m['questions_chosen']} within one turn)",
+        f"{'asks':<24}  {m['asked']}",
+        f"{'  question chosen':<24}  {_rate(m['question_yield'])}  "
+        f"({m['questions_chosen']}/{m['asked']} found one worth asking)",
+        f"{'  user answered':<24}  {_rate(m['answer_rate'])}  "
+        f"({m['questions_answered']}/{m['questions_chosen']} drew new user evidence)",
         f"{'  mean predicted spread':<24}  {_num(m['mean_predicted_spread'])}",
         f"{'unresolved threads':<24}  {len(ages)}",
         f"{'  oldest (turns unused)':<24}  {oldest}",
@@ -303,9 +367,10 @@ def chat_summary(records):
 
 
 # The scripted conversation behind chat_session.jsonl. Six turns chosen to
-# make each measure land on a number worth arguing about: a chosen question
-# the board ignores, one it follows, a reveal the checker blocks, and an ask
-# the selector declines outright.
+# make each measure land on a number worth arguing about: a question the user
+# answers with new evidence, one they answer with an assumption nobody can
+# use, an ask the selector declines outright, and a reveal the checker blocks
+# whose refused citation has to stay counted as an open thread.
 _DEMO_HYPOTHESES = [
     ("blackwood", "Lord Blackwood did it"),
     ("margaret", "Lady Margaret did it"),
@@ -335,7 +400,8 @@ _DEMO_SCRIPT = [
        {"blackwood": "yes", "margaret": "yes", "ellis": "yes", "jeeves": "yes"})]),
 
     ("The butler had one, I'm sure of it.",
-     [("photo", "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact", ()),
+     [("butler_key", "user: 'the butler had a key to the study'", "stated_by_user", ()),
+      ("photo", "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact", ()),
       ("cleared_margaret", "Margaret could not have been at the scene", "inferred_by_model", ("photo",))],
      {"move": "reveal", "cited": ["cleared_margaret"], "rule_out": "margaret"}, []),
 
@@ -386,7 +452,7 @@ def _demo_chat(path):
                     return f"(turn {i} reply, in character)"
 
                 out = turn_mod.run_turn(core, persona, i, message, generate, mode=turn_mod.TWO_PASS)
-                ledger = {e.id: e.supports for e in core.ledger.entries()}
+                ledger = {e.id: e for e in core.ledger.entries()}
                 row = chat_record(out, core.board.live_ids(), ledger)
                 out_file.write(json.dumps(row) + "\n")
     return path
@@ -468,32 +534,79 @@ def _self_check():
     assert real["Wren"]["word_share"] > real["Vale"]["word_share"], "Wren argues at greater length"
 
     # --- narrator-c5b.3.7: the chat measures. ---
-    # Hand-built rows first, so a failure here points at a measure rather than
-    # at the scripted conversation below.
-    chat_rows = [
-        {"turn": 0, "move": "ask", "cited": [], "live": ["a", "b", "c"],
-         "ledger": {"e0": []},
-         "question": {"chosen": "q", "scored": [{"id": "q", "score": 0.6, "discriminates": True}]}},
-        {"turn": 1, "move": "reveal", "cited": ["e1"], "live": ["a", "b"],
-         "ledger": {"e0": [], "e1": ["e0"]}, "question": None},
-    ]
-    assert is_chat_log(chat_rows)
-    # e0 is never cited, but it grounds e1, which is. An entry used as
-    # support is used, not abandoned.
-    assert unresolved_threads(chat_rows) == {}
-    cm = chat_metrics(chat_rows)
-    assert cm["questions_chosen"] == 1
-    assert cm["questions_landed"] == 1 and cm["landing_rate"] == 1.0, "3 live -> 2 live is a narrowing"
-    assert cm["abstention_rate"] == 0.0
+    # Hand-built rows first, so a failure points at a measure rather than at
+    # the scripted conversation below.
+    def row(turn, move, **kw):
+        base = {"turn": turn, "move": move, "cited": [], "live": ["a", "b", "c"],
+                "ledger": {}, "question": None}
+        base.update(kw)
+        return base
 
-    # Cut the supports link and the same entry becomes an abandoned thread,
-    # aged from the row it first appeared in.
-    chat_rows[1]["ledger"]["e1"] = []
+    def entry(supports=(), provenance="stated_by_user"):
+        return {"supports": list(supports), "provenance": provenance}
+
+    q_chosen = {"chosen": "q", "scored": [{"id": "q", "score": 0.5, "discriminates": True}]}
+
+    assert log_kind([]) is None
+    assert log_kind([{"nothing": 1}]) is None
+
+    # An entry used only as support for a cited inference is used, not abandoned.
+    photo, inference = entry(provenance="observed_artifact"), entry(("e0",), "inferred_by_model")
+    chat_rows = [
+        row(0, "ask", ledger={"e0": photo}, question=q_chosen),
+        row(1, "reveal", cited=["e1"], live=["a", "b"], ledger={"e0": photo, "e1": inference}),
+    ]
+    assert log_kind(chat_rows) == "chat" and is_chat_log(chat_rows)
+    assert unresolved_threads(chat_rows) == {}
+
+    # Cut the supports link and it becomes an abandoned thread, aged from the
+    # row it first appeared in.
+    chat_rows[1]["ledger"]["e1"] = entry(provenance="inferred_by_model")
     assert unresolved_threads(chat_rows) == {"e0": 1}
 
-    # A question chosen on the last turn has no following turn to narrow
-    # anything, so it cannot have landed -- and must not crash looking.
-    assert chat_metrics([chat_rows[0]])["questions_landed"] == 0
+    # A citation on an ABSTAINED turn is not a use -- admissibility refused
+    # it. This is the case the measure most has to get right: an ungrounded
+    # claim the checker rejected, and everything under it, is the gun left on
+    # the mantel, and counting the refusal as resolution deletes exactly that.
+    ledger = {"g": entry(provenance="assumed"), "h": entry(("g",), "inferred_by_model")}
+    blocked = [row(0, "complicate", ledger=ledger), row(9, "abstain", cited=["h"], ledger=ledger)]
+    assert unresolved_threads(blocked) == {"g": 9, "h": 9}, unresolved_threads(blocked)
+    # The same citation on a reveal that landed IS a use, transitively.
+    assert unresolved_threads([blocked[0], dict(blocked[1], move="reveal")]) == {}
+
+    # Ages come from the largest turn, not the last row, so a log that is not
+    # turn-monotonic cannot produce a negative age.
+    assert unresolved_threads([row(9, "complicate", ledger={"x": entry()}),
+                               row(0, "complicate", ledger={"x": entry()})]) == {"x": 0}
+    try:
+        unresolved_threads([])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an empty log should have been rejected by unresolved_threads too")
+
+    # The user answered iff NEW stated_by_user evidence arrives next turn.
+    def answered_with(provenance):
+        return chat_metrics([
+            row(0, "ask", question=q_chosen, ledger={"old": entry()}),
+            row(1, "complicate", ledger={"old": entry(), "new": entry(provenance=provenance)}),
+        ])["questions_answered"]
+
+    assert answered_with("stated_by_user") == 1
+    assert answered_with("observed_artifact") == 0, "only the user's own evidence answers a question"
+    assert answered_with("inferred_by_model") == 0, "the model answering itself is not an answer"
+    # Evidence that was already on the record is not an answer.
+    assert chat_metrics([row(0, "ask", question=q_chosen, ledger={"old": entry()}),
+                         row(1, "complicate", ledger={"old": entry()})])["questions_answered"] == 0
+    # A question chosen on the final turn has no next turn, and must not crash.
+    assert chat_metrics([row(0, "ask", question=q_chosen)])["questions_answered"] == 0
+
+    # Yield is over asks, not turns: a declined ask still carries a question
+    # block, with chosen=None.
+    yielded = chat_metrics([row(0, "ask", question=q_chosen),
+                            row(1, "abstain", question={"chosen": None, "scored": []})])
+    assert (yielded["asked"], yielded["questions_chosen"]) == (2, 1)
+    assert yielded["question_yield"] == 0.5
 
     # Now the scripted conversation, run through the real C5 loop.
     with tempfile.TemporaryDirectory() as d:
@@ -504,21 +617,20 @@ def _self_check():
     assert cm["moves"] == {"ask": 2, "complicate": 1, "reveal": 1, "abstain": 2}, cm["moves"]
     assert cm["abstentions"] == 2, "one blocked reveal, one ask the selector declined"
     assert round(cm["abstention_rate"], 4) == 0.3333
-    # Three asks were requested; the third found nothing worth asking, so it
-    # was downgraded and chose no question (narrator-ncp).
-    assert cm["questions_chosen"] == 2
-    assert cm["questions_landed"] == 1 and cm["landing_rate"] == 0.5
+    assert (cm["asked"], cm["questions_chosen"]) == (3, 2), "the third ask found nothing worth asking"
+    assert round(cm["question_yield"], 4) == 0.6667
+    assert cm["questions_answered"] == 1 and cm["answer_rate"] == 0.5
     assert round(cm["mean_predicted_spread"], 4) == 0.6875, cm["mean_predicted_spread"]
-    # The gap between a 0.69 mean predicted spread and a 50% landing rate is
-    # the number this measure exists to expose: the selector scores how far
-    # the hypotheses' predicted answers diverge, which is a claim about the
-    # board, not a forecast about the conversation.
-    assert cm["mean_predicted_spread"] > cm["landing_rate"]
-    assert cm["unresolved"] == {"saw_margaret": 5, "rumour": 4}, cm["unresolved"]
-    assert cm["oldest_unresolved"] == 5 and cm["mean_unresolved_age"] == 4.5
-    assert "photo" not in cm["unresolved"], "photo grounds a cited inference, so it was used"
+    assert cm["unresolved"] == {"saw_margaret": 5, "rumour": 4, "butler_key": 2, "hunch": 1}, cm["unresolved"]
+    assert cm["oldest_unresolved"] == 5 and cm["mean_unresolved_age"] == 3.0
+    # photo and the inference it grounds were both used, by a reveal that landed.
+    assert not {"photo", "cleared_margaret"} & set(cm["unresolved"])
+    # hunch WAS cited -- by the reveal admissibility refused -- and stays open.
+    assert "hunch" in cm["unresolved"], "a refused citation is the thread this measure exists to find"
+
     rendered = chat_summary(chat)
-    for expected in ("abstention rate", "33.3%", "50.0%", "0.688", "saw_margaret (5)", "4.5"):
+    for expected in ("abstention rate", "33.3%", "66.7%", "50.0%", "0.688",
+                     "saw_margaret (5)", "3"):
         assert expected in rendered, f"{expected!r} missing from the summary:\n{rendered}"
 
     # The committed log is what the CLI runs over, so it has to be the log
@@ -526,10 +638,13 @@ def _self_check():
     assert load_transcript("chat_session.jsonl") == chat, (
         "chat_session.jsonl is stale: regenerate with metrics._demo_chat('chat_session.jsonl')")
 
-    # A debate transcript is not a chat log, and says so instead of producing
-    # numbers about fields it does not have.
+    # Each of the repo's three JSONL formats is identified positively, so the
+    # ledger sitting next to a chat log is named rather than crashing the
+    # debate path on a missing 'speaker'.
     debate = load_transcript("scarce_resource.jsonl")
-    assert not is_chat_log(debate)
+    assert log_kind(debate) == "debate" and not is_chat_log(debate)
+    assert log_kind([{"id": "e", "turn": 0, "claim": "x", "provenance": "assumed",
+                      "supports": []}]) == "ledger"
     for bad, expect, why in ((debate, "not a chat log", "a debate transcript"),
                              ([], "empty chat log", "an empty log")):
         try:
@@ -548,6 +663,14 @@ def _self_check():
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         _records = load_transcript(sys.argv[1])
-        print(chat_summary(_records) if is_chat_log(_records) else summary(_records))
+        _kind = log_kind(_records)
+        if _kind == "chat":
+            print(chat_summary(_records))
+        elif _kind == "debate":
+            print(summary(_records))
+        elif _kind == "ledger":
+            sys.exit(f"{sys.argv[1]}: that is an evidence ledger, not a transcript or chat log")
+        else:
+            sys.exit(f"{sys.argv[1]}: not a recognised transcript, chat log or ledger")
     else:
         _self_check()
