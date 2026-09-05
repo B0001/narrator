@@ -633,6 +633,30 @@ def _self_check():
                      "saw_margaret (5)", "3"):
         assert expected in rendered, f"{expected!r} missing from the summary:\n{rendered}"
 
+    # SINGLE_PASS is the one mode _demo_chat never exercises -- it makes a
+    # single call and its TurnOutput carries no question_log at all -- and a
+    # record is only worth anything if the file survives the round trip the
+    # CLI puts it through.
+    with tempfile.TemporaryDirectory() as d:
+        import turn as _turn
+        from chat_core import ChatCore as _ChatCore
+        from ocean import Ocean as _Ocean
+        with _ChatCore(f"{d}/l.jsonl", _DEMO_HYPOTHESES) as _core:
+            _core.observe("e0", 0, "user: 'the door was locked'", "stated_by_user")
+            _out = _turn.run_turn(
+                _core, _Ocean(neuroticism=0.5), 0, "hm",
+                lambda profile, prompt, model=None: json.dumps(
+                    {"move": "complicate", "cited": ["e0"], "rule_out": None,
+                     "reply": "Curious. Say more about that door."}),
+                mode=_turn.SINGLE_PASS)
+            _rec = chat_record(_out, _core.board.live_ids(),
+                               {e.id: e for e in _core.ledger.entries()})
+        assert _rec["question"] is None, "a single-pass turn has no question log to record"
+        assert _rec["ledger"] == {"e0": {"supports": [], "provenance": "stated_by_user"}}, _rec["ledger"]
+        with open(f"{d}/one.jsonl", "w") as f:
+            f.write(json.dumps(_rec) + "\n")
+        assert load_transcript(f"{d}/one.jsonl") == [_rec], "a record must survive its own round trip"
+
     # The committed log is what the CLI runs over, so it has to be the log
     # this code actually produces, not a copy that drifted away from it.
     assert load_transcript("chat_session.jsonl") == chat, (
