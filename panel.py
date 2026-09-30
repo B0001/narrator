@@ -86,16 +86,20 @@ class Checker:
         return admissibility_check(ledger, cited_ids)
 
 
-def run_panel(ledger, cited_ids, proposer_prompt, critic_prompt, generate_fn, model="llama3"):
+def run_panel(ledger, cited_ids, proposer_prompt, critic_prompt, generate_fn, model=None):
     """One round: proposer speaks, critic speaks, checker rules -- three
     different jobs, not three turns of the same job.
 
     Returns `(proposer_text, critic_text, verdict)`. `generate_fn` follows
     `ocean.generate`'s shape, the same injectable-for-testing convention as
     `agents.converse` and `turn.run_turn`.
+
+    model=None (narrator-c5b.2.4): no Ollama-shaped default -- which model
+    answers is the backend's call, not this function's.
     """
-    proposer_text = generate_fn(PROPOSER.profile, proposer_prompt, model=model).strip()
-    critic_text = generate_fn(CRITIC.profile, critic_prompt, model=model).strip()
+    kwargs = {} if model is None else {"model": model}
+    proposer_text = generate_fn(PROPOSER.profile, proposer_prompt, **kwargs).strip()
+    critic_text = generate_fn(CRITIC.profile, critic_prompt, **kwargs).strip()
     verdict = Checker().verdict(ledger, cited_ids)
     return proposer_text, critic_text, verdict
 

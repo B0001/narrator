@@ -64,7 +64,7 @@ def _estimate_tokens(text):
     return max(1, len(text) // 4)
 
 
-def converse(agents, topic, turns=6, path="transcript.jsonl", model="llama3", generate_fn=generate,
+def converse(agents, topic, turns=6, path="transcript.jsonl", model=None, generate_fn=generate,
              token_budget=DEFAULT_TOKEN_BUDGET):
     """Round-robin the agents over a shared transcript, logging every turn to JSONL.
 
@@ -79,11 +79,15 @@ def converse(agents, topic, turns=6, path="transcript.jsonl", model="llama3", ge
     continuing to spend on a backend that bills per token. Pass token_budget=
     None to disable the ceiling (e.g. for a backend you know is free, like a
     local Ollama run with time to spare).
+
+    model=None (narrator-c5b.2.4): no Ollama-shaped default -- which model
+    answers is the backend's call, not this function's.
     """
     if not agents:
         raise ValueError("need at least one agent")
     log = []
     spent = 0
+    kwargs = {} if model is None else {"model": model}
     with open(path, "w") as f:
         for turn in range(turns):
             agent = agents[turn % len(agents)]
@@ -95,13 +99,15 @@ def converse(agents, topic, turns=6, path="transcript.jsonl", model="llama3", ge
                     f"over the {token_budget}-token ceiling ({spent} spent across {turn} turns so far). "
                     "Raise token_budget, or use fewer turns/agents, to continue."
                 )
-            reply = generate_fn(agent.profile, prompt, model=model).strip()
+            raw = generate_fn(agent.profile, prompt, **kwargs)
+            reply = raw.strip()
             spent = projected + _estimate_tokens(reply)
             record = {
                 "turn": turn,
                 "speaker": agent.name,
                 "profile": asdict(agent.profile),
                 "text": reply,
+                "model": getattr(raw, "model", "unknown"),
             }
             f.write(json.dumps(record) + "\n")
             f.flush()
@@ -162,6 +168,25 @@ def _self_check():
         assert log[0]["text"] == "line 1 from a profile with A=-0.8", "text must be stripped"
         assert log[0]["profile"]["agreeableness"] == -0.8, "each turn records the profile that spoke"
         assert load_transcript(path) == log, "JSONL must round-trip to the in-memory log"
+
+        # narrator-c5b.2.4: every turn records which model answered, or an
+        # explicit "unknown" -- fake_generate returns a plain str, so it has
+        # nothing to report and every turn must say so rather than guess.
+        assert all(r["model"] == "unknown" for r in log), "a plain-str reply must record model=unknown"
+
+        # A backend that reports which model answered (e.g. backends.base.
+        # Reply) must have that name reach the transcript, not "unknown".
+        class NamedReply(str):
+            def __new__(cls, text, model):
+                self = super().__new__(cls, text)
+                self.model = model
+                return self
+
+        def named_generate(profile, prompt, model=None):
+            return NamedReply("a reply", "claude-fable-5")
+
+        named_log = converse(pair, "who gets the last seat", turns=1, path=path, generate_fn=named_generate)
+        assert named_log[0]["model"] == "claude-fable-5", "a Reply-shaped answer's model must reach the transcript"
 
         # Turn 0 sees nothing; later turns see every prior line, so context accumulates.
         assert "(nobody has spoken yet)" in seen[0]

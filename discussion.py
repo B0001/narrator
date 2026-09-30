@@ -122,13 +122,17 @@ def final_answer(records, suspects):
 
 
 def run_discussion(seed=None, n_agents=3, turns=8, path="discussion_transcript.jsonl",
-                    model="llama3", generate_fn=generate, agent_names=None):
+                    model=None, generate_fn=generate, agent_names=None):
     """Build a mystery, partition its clues, and run the discussion over the split.
 
     Every agent's `evidence` is exactly their `partition.agent_clues(i)` --
     never the pooled set, never sim.culprit. The group's answer is scored
     against sim.culprit only after the fact, by a function (`final_answer`)
     that never received it either.
+
+    model=None (narrator-c5b.2.4): forwarded to converse() unchanged -- no
+    Ollama-shaped default here either, since this function doesn't know which
+    backend generate_fn is bound to any more than converse() does.
     """
     sim, clues = mystery.build(seed=seed)
     partition = clue_partition.partition(clues, n_agents=n_agents, seed=seed)

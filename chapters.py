@@ -74,7 +74,7 @@ def _prompt(payload):
     )
 
 
-def write_chapters(sim, clues, model="llama3", generate_fn=generate, narrator=NARRATOR):
+def write_chapters(sim, clues, model=None, generate_fn=generate, narrator=NARRATOR):
     """One chapter per DAG node, in topological order, earliest event first.
 
     generate_fn is injectable so the whole pipeline runs without a model.
@@ -83,13 +83,19 @@ def write_chapters(sim, clues, model="llama3", generate_fn=generate, narrator=NA
     alphabetically. Chapter one is still the discovery of the body: Root is an
     ancestor of every clue, so no ordering can precede it, and opening on the
     corpse is what a mystery does anyway.
+
+    model=None (narrator-c5b.2.4): this function must not assume which
+    backend generate_fn is bound to, so it does not default to an
+    Ollama-shaped model name -- omitting the kwarg entirely lets whichever
+    backend is plugged in fall back to its own default.
     """
     order = list(nx.lexicographical_topological_sort(
         clues.dag, key=lambda n: (clues.dag.nodes[n].get("t", 0), n)))
     prose, chapters = {}, []
+    kwargs = {} if model is None else {"model": model}
     for node in order:
         payload = _payload(clues, node, order, prose, sim)
-        prose[node] = generate_fn(narrator, _prompt(payload), model=model).strip()
+        prose[node] = generate_fn(narrator, _prompt(payload), **kwargs).strip()
         chapters.append({"node": node, "payload": payload, "prose": prose[node]})
     return chapters
 

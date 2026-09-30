@@ -110,8 +110,15 @@ def to_mermaid(g, path=None):
     return "\n".join(lines)
 
 
-def prose(g, path, model="llama3"):
-    """Turn the path into story beats, one per state, in order."""
+def prose(g, path, model=None):
+    """Turn the path into story beats, one per state, in order.
+
+    model=None (narrator-c5b.2.4) leaves which model answers to the backend
+    generate() is bound to -- Ollama's "qwen2.5-coder:14b" and Fable's
+    "claude-fable-5" mean nothing to the other's API, so this function must
+    not assert either one as a default; only the backend module a caller
+    actually points generate at knows what its own model names are.
+    """
     from ocean import Ocean, generate
 
     states = "\n".join(f"{i}. {n.replace('_', ' ')}: {g.nodes[n]['desc']}" for i, n in enumerate(path, 1))
@@ -122,7 +129,8 @@ def prose(g, path, model="llama3"):
         "Each beat is two or three sentences of a mystery novel outline showing that state in "
         "action. Keep the same character throughout. Do not name the psychological state; show it."
     )
-    return generate(Ocean(openness=0.5, conscientiousness=0.6), prompt, model=model)
+    kwargs = {} if model is None else {"model": model}
+    return generate(Ocean(openness=0.5, conscientiousness=0.6), prompt, **kwargs)
 
 
 def _self_check():

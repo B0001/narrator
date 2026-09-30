@@ -19,6 +19,14 @@ Only DIRECT entries are evidence a user has seen with their own eyes. A
 DERIVED entry can still be admissible later (that is `admissibility.py`'s
 job), but never because of its own provenance tag alone.
 
+`prompted_by` (narrator-5ob) is the other half of provenance: not just where
+a claim came from, but what turn's question drew it out, if any. `supports`
+already lets a citation chain be walked backward through inference; this is
+the same idea aimed at a different question -- not "what does this entry
+rest on" but "why does this entry exist at all". Nothing in this module reads
+it; it is a fact recorded at write time (see `question_selector.question_id`
+for how the id itself is built), for `metrics.py` to walk later.
+
     python3 evidence_ledger.py   # self-check
 """
 
@@ -37,6 +45,10 @@ class LedgerEntry:
     claim: str
     provenance: str
     supports: tuple = field(default_factory=tuple)  # ids this entry was derived from
+    # id of the question (see question_selector.question_id) that prompted
+    # this entry, or None -- the entry arose some other way (unprompted user
+    # statement, an artifact, a model inference not answering anything asked).
+    prompted_by: str = None
 
 
 class EvidenceLedger:
@@ -53,10 +65,17 @@ class EvidenceLedger:
         self._order = []
         self._file = open(path, "a")
 
-    def write(self, entry_id, turn, claim, provenance, supports=()):
+    def write(self, entry_id, turn, claim, provenance, supports=(), prompted_by=None):
         """Append one entry. Rejects reuse of an id and any untagged/unknown
         provenance at write time -- there is no such thing as evidence with
         no source, so refusing it here beats discovering it later at read time.
+
+        `prompted_by`, if given, must be a non-empty string naming the
+        question that elicited this entry -- see `question_selector.
+        question_id`. It is not checked against a registry of questions
+        actually asked (the ledger has no notion of a "question" of its
+        own); like `claim` itself, it is the caller's assertion, recorded so
+        it can be checked against the rest of the transcript later.
         """
         if entry_id in self._entries:
             raise ValueError(f"duplicate ledger entry id {entry_id!r}")
@@ -68,8 +87,10 @@ class EvidenceLedger:
         unknown_supports = [s for s in supports if s not in self._entries]
         if unknown_supports:
             raise ValueError(f"entry {entry_id!r} supports unknown ids {unknown_supports}")
+        if prompted_by is not None and not prompted_by.strip():
+            raise ValueError(f"entry {entry_id!r} has a blank prompted_by; use None for 'nothing prompted this'")
 
-        entry = LedgerEntry(entry_id, turn, claim, provenance, tuple(supports))
+        entry = LedgerEntry(entry_id, turn, claim, provenance, tuple(supports), prompted_by)
         self._entries[entry_id] = entry
         self._order.append(entry_id)
         self._file.write(json.dumps(asdict(entry)) + "\n")
@@ -114,6 +135,7 @@ def load(path):
                 raise ValueError(f"{path}:{lineno}: {e}") from e
             entries.append(LedgerEntry(
                 raw["id"], raw["turn"], raw["claim"], raw["provenance"], tuple(raw["supports"]),
+                raw.get("prompted_by"),
             ))
     return entries
 
@@ -129,6 +151,15 @@ def _self_check():
             ledger.write("e1", 0, "user said the window was locked", "stated_by_user")
             ledger.write("e2", 0, "photo shows the window latch engaged", "observed_artifact")
             ledger.write("e3", 1, "the intruder didn't come through the window", "inferred_by_model", supports=("e1", "e2"))
+
+            # narrator-5ob: an entry can name the question that drew it out.
+            answer = ledger.write(
+                "e4", 2, "user: 'nobody else had a key'", "stated_by_user", prompted_by="1:who_else",
+            )
+            assert answer.prompted_by == "1:who_else"
+            # Most entries prompt nothing -- unprompted is the default, not a
+            # value every caller has to spell out.
+            assert ledger.get("e1").prompted_by is None
 
             # Untagged / unknown provenance is rejected at write time, not read time.
             try:
@@ -148,17 +179,28 @@ def _self_check():
 
             # Supporting an entry that doesn't exist yet is rejected.
             try:
-                ledger.write("e4", 2, "dangling support", "inferred_by_model", supports=("nope",))
+                ledger.write("e5", 2, "dangling support", "inferred_by_model", supports=("nope",))
             except ValueError:
                 pass
             else:
                 raise AssertionError("support referencing an unknown id should have been rejected")
 
+            # A blank prompted_by is refused -- None is the "nothing prompted
+            # this" value, not an empty string standing in for it.
+            try:
+                ledger.write("e6", 2, "text", "assumed", prompted_by="   ")
+            except ValueError as e:
+                assert "prompted_by" in str(e)
+            else:
+                raise AssertionError("a blank prompted_by should have been rejected")
+
         loaded = load(path)
-        assert [e.id for e in loaded] == ["e1", "e2", "e3"], "ledger must read back in write order"
+        assert [e.id for e in loaded] == ["e1", "e2", "e3", "e4"], "ledger must read back in write order"
         assert loaded[2].supports == ("e1", "e2")
         assert loaded[0].provenance in DIRECT
         assert loaded[2].provenance in DERIVED
+        assert loaded[3].prompted_by == "1:who_else"
+        assert loaded[0].prompted_by is None, "prompted_by must round-trip as None, not a missing attribute"
 
         # A run killed mid-write: the first two lines are whole, the third is
         # a truncated fragment.

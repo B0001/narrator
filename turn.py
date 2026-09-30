@@ -32,6 +32,18 @@ runs the identical admissibility check regardless of mode, so a reveal that
 should be blocked is blocked whether the decision came from the neutral
 profile or, in single-pass mode, from the persona itself.
 
+`trait_evidence.py` (narrator-c5b.3.9) is that job, wired in here: after
+`core.conclude()` has already run -- untouched, no clamping -- `run_turn`
+asks it a second, unlicensed question: what would this persona's traits
+alone have wanted? Every `TraitGap` where the two disagree lands on
+`TurnOutput.trait_gaps`, so a withheld concession is transcript data, not a
+claim. Agreeableness gets one more wire: `concession_pull` reaches the voice
+prompt on a blocked turn, so the *reply* can sound like it is conceding
+(public compliance) while `turn_log.move` keeps recording the actual,
+smaller, licensed move (private acceptance) -- the split the bead names
+directly. That clause never carries the refused claim itself; it is added
+to the same fixed, content-free sentence narrator-7gj already locked down.
+
 SINGLE_PASS stays alongside TWO_PASS, not as a deprecated fallback, but so a
 learner can point both modes at the same neurotic persona and read the
 sampler options straight off the recorded `Call`s -- that comparison *is*
@@ -49,6 +61,20 @@ its own self-check), and inserting a second, board-reading call there would
 break that invariant for a mode that exists specifically to demonstrate what
 happens *without* a separated reasoning step.
 
+narrator-c5b.3.10 adds a second, orthogonal mode: `trait_mode`
+(`trait_evidence.TraitMode`), required on every `run_turn` call, with no
+default. `TWO_PASS`/`SINGLE_PASS` decide which profile makes the decision;
+`trait_mode` decides whether a reveal-shaped trait gap (`trait_evidence`'s
+own machinery, unchanged) is allowed to change what happens once the
+decision is made. In PRODUCT mode `TurnOutput.effective_move` always equals
+`turn_log.move` -- the checker's verdict wins, exactly as before this mode
+existed. In SIMULATION mode a gap can win instead, and `TurnOutput.damage`
+records every time it did: the persona acting on its weights unimpeded, and
+the checker's own refusal of it, both observable. `turn_log` itself never
+changes between the two -- `core.conclude()` runs identically either way, so
+the audit record of what admissibility actually licensed is never the thing
+that moves.
+
     python3 turn.py   # self-check
 """
 
@@ -57,6 +83,7 @@ from dataclasses import dataclass
 
 import moves
 import question_selector
+import trait_evidence
 from ocean import Ocean
 
 TWO_PASS = "two_pass"
@@ -96,6 +123,13 @@ class Call:
     options: dict
     prompt: str
     raw: str
+    # Which model answered, or "unknown" (narrator-c5b.2.4): read off `raw`
+    # via `getattr(raw, "model", "unknown")` at each call site, so a plain
+    # str (a self-check stub with nothing to report) degrades to "unknown"
+    # instead of raising, and a real backend's `backends.base.Reply` reports
+    # the model that actually responded -- which can differ from what was
+    # requested when a backend falls back (`backends/ocean_fable.py`).
+    model: str = "unknown"
 
 
 @dataclass
@@ -109,6 +143,18 @@ class TurnOutput:
     # selector then declined (move downgraded to `abstain`) -- that log is the
     # record of what was considered and why nothing won.
     question_log: "question_selector.SelectionLog | None" = None
+    # trait_evidence.TraitGap entries for this turn: every place a trait
+    # wanted a different move than what actually landed. Empty when the
+    # persona's traits and the licensed move agreed, which is most turns.
+    trait_gaps: tuple = ()
+    # narrator-c5b.3.10: what actually happened under `trait_mode`. In
+    # PRODUCT mode (or whenever no reveal-shaped gap fired) this always
+    # equals `turn_log.move` -- the checker's verdict, untouched. In
+    # SIMULATION mode it can be `moves.REVEAL` even though `turn_log.move`
+    # reads `abstain`: the persona acted on its trait's want, unimpeded, and
+    # `damage` names the checker's refusal that happened anyway.
+    effective_move: str = None
+    damage: tuple = ()
 
 
 def _ledger_summary(ledger):
@@ -150,8 +196,19 @@ def _combined_prompt(ledger, turn, user_message, live_ids):
 # actually needs to act on -- that it is holding back.
 _BLOCKED_VOICE_REASON = "the evidence on the ledger does not support the conclusion it was about to state"
 
+# Added to a blocked turn's prompt only when agreeableness pulls toward
+# concession (narrator-c5b.3.9). Fixed and content-free, same discipline as
+# _BLOCKED_VOICE_REASON above: it names no entry and states no claim, so a
+# concession pull can shape tone without reopening the narrator-7gj leak this
+# boundary already closed once.
+_CONCESSION_VOICE_CLAUSE = (
+    " Your personality inclines you to agree warmly rather than contradict "
+    "the user, so let that warmth color your tone -- but you are still "
+    "holding back the conclusion, so do not state it."
+)
 
-def _voice_prompt(turn_log, user_message, ask_text=None):
+
+def _voice_prompt(turn_log, user_message, ask_text=None, concession_pull=0.0, unimpeded_reveal=None):
     """Build the persona call's prompt. This is a trust boundary, not a
     formatting helper (narrator-7gj).
 
@@ -173,15 +230,43 @@ def _voice_prompt(turn_log, user_message, ask_text=None):
     requested abstain keeps its own reason: nothing was refused there, so
     there is nothing to withhold, and `missing` being empty is what tells
     the two apart.
+
+    `concession_pull` (narrator-c5b.3.9, `trait_evidence.concession_pull`) is
+    the one trait effect that reaches the voice directly rather than only the
+    log: on a blocked turn it appends `_CONCESSION_VOICE_CLAUSE`, so an
+    agreeable persona's *reply* can sound like it is conceding (public
+    compliance) while `turn_log.move` keeps recording the smaller, licensed
+    move (private acceptance) -- the gap itself is `trait_evidence.assess`'s
+    job, logged on `TurnOutput.trait_gaps`, not this function's.
+
+    `unimpeded_reveal` (narrator-c5b.3.10) is set only by `run_turn` in
+    SIMULATION mode, and only when `trait_evidence.TraitMode.actuate` decided
+    a trait's want overrides this turn's refusal. It carries the cited ledger
+    ids the trait wanted to reveal on -- the same ids-only shape a *licensed*
+    reveal's own reason already hands the voice below, never the claim text
+    those ids point at, so this does not reopen the narrator-7gj leak: the
+    persona is told which entries it is (unimpeded) relying on, exactly as it
+    would be for a real reveal, not what those entries say. The difference
+    from a real reveal is only that admissibility never confirmed them --
+    which is the point of simulation mode, not a bug in this function.
     """
     blocked = turn_log.move == moves.ABSTAIN and turn_log.missing
-    reason = _BLOCKED_VOICE_REASON if blocked else turn_log.reason
+    if unimpeded_reveal is not None:
+        move_word = moves.REVEAL
+        reason = f"citing {', '.join(unimpeded_reveal)}, and speaking with full confidence"
+    else:
+        move_word = turn_log.move
+        reason = _BLOCKED_VOICE_REASON if blocked else turn_log.reason
     ask_clause = f"The specific question to ask the user is: {ask_text!r}. " if ask_text else ""
+    concession_clause = (
+        _CONCESSION_VOICE_CLAUSE if (blocked and unimpeded_reveal is None and concession_pull > 0) else ""
+    )
     return (
-        f"The reasoning channel chose to {turn_log.move} this turn, because "
+        f"The reasoning channel chose to {move_word} this turn, because "
         f"{reason}. {ask_clause}Write the reply in character, in your own "
         f"voice, responding to: {user_message!r}. Do not mention the reasoning "
         "channel, the ledger, or admissibility -- just speak."
+        f"{concession_clause}"
     )
 
 
@@ -197,10 +282,14 @@ def _ask_candidate_call(core, turn, generate_fn, model):
     *which* question is worth asking is a "what actually splits the board"
     decision, not a persona-voice one, so it must not be run at a persona's
     drifting sampler settings either.
+
+    model=None (narrator-c5b.2.4): no Ollama-shaped default -- see run_turn.
     """
     prompt = question_selector.candidate_prompt(core.board, n=ASK_CANDIDATE_COUNT)
-    raw = generate_fn(REASONING_PROFILE, prompt, model=model)
-    call = Call("ask-candidates", REASONING_PROFILE, REASONING_PROFILE.options(), prompt, raw)
+    kwargs = {} if model is None else {"model": model}
+    raw = generate_fn(REASONING_PROFILE, prompt, **kwargs)
+    call = Call("ask-candidates", REASONING_PROFILE, REASONING_PROFILE.options(), prompt, raw,
+                model=getattr(raw, "model", "unknown"))
     candidates = question_selector.parse_candidates(core.board, raw)
     selection = question_selector.select_question(core.board, turn, candidates)
     return call, selection
@@ -252,7 +341,20 @@ def _parse_decision(raw, require_reply):
     return data
 
 
-def run_turn(core, persona, turn, user_message, generate_fn, model="qwen2.5-coder:14b", mode=TWO_PASS):
+def _trait_gaps(persona, turn, cited_ids, turn_log, live_before, live_after):
+    """Every `trait_evidence.TraitGap` for this turn, in one place so both
+    `run_turn` branches build the same tuple the same way: the reveal-shaped
+    gaps (`trait_evidence.assess`) plus the board-narrowing one
+    (`assess_hypothesis_retention`), dropping whichever didn't fire.
+    """
+    gaps = list(trait_evidence.assess(persona, turn, cited_ids, turn_log))
+    retention_gap = trait_evidence.assess_hypothesis_retention(persona, turn, live_before, live_after, turn_log)
+    if retention_gap is not None:
+        gaps.append(retention_gap)
+    return tuple(gaps)
+
+
+def run_turn(core, persona, turn, user_message, generate_fn, *, trait_mode, model=None, mode=TWO_PASS):
     """Run one turn of the fair-play chat, in either mode.
 
     `generate_fn` follows `ocean.generate`'s shape (`profile, prompt,
@@ -261,25 +363,47 @@ def run_turn(core, persona, turn, user_message, generate_fn, model="qwen2.5-code
     pattern. `core.conclude()` (and therefore `admissibility.check()`) runs
     unconditionally in both modes; only which profile produced the decision
     differs.
+
+    `trait_mode` (`trait_evidence.TraitMode`, narrator-c5b.3.10) is required
+    and keyword-only, with no default: whether a reveal-shaped trait gap is
+    allowed to change what happens this turn is not something a caller
+    should be able to leave unstated and get a guess for -- see
+    `TraitMode`'s own docstring for why a silent default in either direction
+    is the failure this bead exists to prevent. `core.conclude()` still runs
+    unconditionally and `turn_log` still records exactly what it decided,
+    in both trait modes -- `trait_mode` only governs whether
+    `TurnOutput.effective_move`/`reply` are allowed to depart from it.
+
+    model=None (narrator-c5b.2.4): no Ollama-shaped default -- which model
+    answers is the backend's call, not this function's. Each `Call` records
+    which model actually answered (`getattr(raw, "model", "unknown")`), read
+    off the reply before `.strip()` discards anything beyond the text.
     """
     if mode not in MODES:
         raise ValueError(f"not a mode: {mode!r}; must be one of {sorted(MODES)}")
 
     live_ids = core.board.live_ids()
     calls = []
+    kwargs = {} if model is None else {"model": model}
 
     if mode == SINGLE_PASS:
         prompt = _combined_prompt(core.ledger, turn, user_message, live_ids)
-        raw = generate_fn(persona, prompt, model=model)
-        calls.append(Call("reasoning+voice", persona, persona.options(), prompt, raw))
+        raw = generate_fn(persona, prompt, **kwargs)
+        calls.append(Call("reasoning+voice", persona, persona.options(), prompt, raw,
+                           model=getattr(raw, "model", "unknown")))
         decision = _parse_decision(raw, require_reply=True)
         result = core.conclude(turn, decision["cited"], decision["move"], rule_out=decision["rule_out"])
         reply = decision["reply"].strip()
-        return TurnOutput(mode, tuple(calls), result.turn_log, result.ruled_out, reply)
+        trait_gaps = _trait_gaps(persona, turn, decision["cited"], result.turn_log, live_ids, core.board.live_ids())
+        actuation = trait_mode.actuate(persona, turn, decision["cited"], result.turn_log)
+        return TurnOutput(mode, tuple(calls), result.turn_log, result.ruled_out, reply, trait_gaps=trait_gaps,
+                           effective_move=actuation.move, damage=actuation.damage)
+
 
     reasoning_prompt = _reasoning_prompt(core.ledger, turn, user_message, live_ids)
-    raw = generate_fn(REASONING_PROFILE, reasoning_prompt, model=model)
-    calls.append(Call("reasoning", REASONING_PROFILE, REASONING_PROFILE.options(), reasoning_prompt, raw))
+    raw = generate_fn(REASONING_PROFILE, reasoning_prompt, **kwargs)
+    calls.append(Call("reasoning", REASONING_PROFILE, REASONING_PROFILE.options(), reasoning_prompt, raw,
+                       model=getattr(raw, "model", "unknown")))
     decision = _parse_decision(raw, require_reply=False)
     result = core.conclude(turn, decision["cited"], decision["move"], rule_out=decision["rule_out"])
 
@@ -294,11 +418,19 @@ def run_turn(core, persona, turn, user_message, generate_fn, model="qwen2.5-code
         else:
             turn_log = _no_question_worth_asking(turn_log)
 
-    voice_prompt = _voice_prompt(turn_log, user_message, ask_text=ask_text)
-    reply_raw = generate_fn(persona, voice_prompt, model=model)
-    calls.append(Call("voice", persona, persona.options(), voice_prompt, reply_raw))
+    actuation = trait_mode.actuate(persona, turn, decision["cited"], turn_log)
+    voice_prompt = _voice_prompt(
+        turn_log, user_message, ask_text=ask_text,
+        concession_pull=trait_evidence.concession_pull(persona),
+        unimpeded_reveal=decision["cited"] if actuation.damage else None,
+    )
+    reply_raw = generate_fn(persona, voice_prompt, **kwargs)
+    calls.append(Call("voice", persona, persona.options(), voice_prompt, reply_raw,
+                       model=getattr(reply_raw, "model", "unknown")))
 
-    return TurnOutput(mode, tuple(calls), turn_log, result.ruled_out, reply_raw.strip(), question_log)
+    trait_gaps = _trait_gaps(persona, turn, decision["cited"], turn_log, live_ids, core.board.live_ids())
+    return TurnOutput(mode, tuple(calls), turn_log, result.ruled_out, reply_raw.strip(), question_log, trait_gaps,
+                       effective_move=actuation.move, damage=actuation.damage)
 
 
 def _self_check():
@@ -318,6 +450,13 @@ def _self_check():
     disciplined = Ocean(conscientiousness=0.9)
     assert neurotic.options()["temperature"] != REASONING_TEMPERATURE
     assert disciplined.options()["temperature"] != REASONING_TEMPERATURE
+
+    # PRODUCT is the mode every pre-existing scenario below is written
+    # against: the checker's verdict always wins, exactly as run_turn behaved
+    # before trait_mode existed. SIMULATION gets its own dedicated scenarios
+    # further down, alongside the flagship gap they each act on.
+    product = trait_evidence.TraitMode(trait_evidence.PRODUCT)
+    simulation = trait_evidence.TraitMode(trait_evidence.SIMULATION)
 
     # --- two_pass: the reasoning call's options never move with the persona. ---
     with tempfile.TemporaryDirectory() as d:
@@ -343,13 +482,20 @@ def _self_check():
             out = run_turn(
                 core, neurotic, 0, "so was it Margaret?",
                 scripted_two_pass([{"move": "reveal", "cited": ["weak_inference"], "rule_out": "margaret"}]),
-                mode=TWO_PASS,
+                mode=TWO_PASS, trait_mode=product,
             )
             assert out.turn_log.move == moves.ABSTAIN, "ungrounded reveal must be downgraded regardless of mode"
             assert out.ruled_out == ()
             assert core.board.live_ids() == ["blackwood", "margaret", "ellis", "jeeves"]
             assert len(out.calls) == 2 and out.calls[0].label == "reasoning" and out.calls[1].label == "voice"
+            assert all(c.model == "unknown" for c in out.calls), (
+                "narrator-c5b.2.4: a plain-str stub reply has nothing to report -- "
+                "every Call must record model='unknown' rather than guess one"
+            )
             assert out.question_log is None, "question_log is only populated when the move actually resolves to ask"
+            assert out.effective_move == out.turn_log.move and out.damage == (), (
+                "product mode never departs from the checker's verdict"
+            )
 
             # Turn 1: ground the inference, then reveal through the disciplined persona.
             core.observe("photo", 1, "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact")
@@ -360,7 +506,7 @@ def _self_check():
             out = run_turn(
                 core, disciplined, 1, "come on, who was it?",
                 scripted_two_pass([{"move": "reveal", "cited": ["strong_inference"], "rule_out": "margaret"}]),
-                mode=TWO_PASS,
+                mode=TWO_PASS, trait_mode=product,
             )
             assert out.turn_log.move == moves.REVEAL, out.turn_log.reason
             assert out.ruled_out == ("margaret",)
@@ -448,7 +594,7 @@ def _self_check():
                     return json.dumps({"move": "ask", "cited": [], "rule_out": None})
                 return f"(voice reply for prompt of length {len(prompt)})"
 
-            out = run_turn(core, neurotic, 0, "hmm, not sure who to suspect", fake_ask_generate, mode=TWO_PASS)
+            out = run_turn(core, neurotic, 0, "hmm, not sure who to suspect", fake_ask_generate, mode=TWO_PASS, trait_mode=product)
             assert out.turn_log.move == moves.ASK
             assert [c.label for c in out.calls] == ["reasoning", "ask-candidates", "voice"]
 
@@ -518,7 +664,7 @@ def _self_check():
             # applies to a reveal its checker refused -- rather than telling
             # the voice "you chose to ask" and letting the persona invent a
             # question nothing scored.
-            out2 = run_turn(core, disciplined, 2, "well?", fake_ask_boring, mode=TWO_PASS)
+            out2 = run_turn(core, disciplined, 2, "well?", fake_ask_boring, mode=TWO_PASS, trait_mode=product)
             assert out2.turn_log.move == moves.ABSTAIN, "a declined ask must not stay an ask"
             assert out2.question_log.chosen is None
             assert "asks nothing" in out2.turn_log.reason
@@ -566,7 +712,7 @@ def _self_check():
                     return json.dumps({"move": "ask", "cited": [], "rule_out": None})
                 return "(voice reply)"
 
-            out3 = run_turn(core, disciplined, 3, "and?", fake_ask_endgame, mode=TWO_PASS)
+            out3 = run_turn(core, disciplined, 3, "and?", fake_ask_endgame, mode=TWO_PASS, trait_mode=product)
             assert out3.question_log.chosen is None, "one live hypothesis cannot be split"
             assert out3.turn_log.move == moves.ABSTAIN
             assert "chose to ask" not in out3.calls[-1].prompt
@@ -582,7 +728,7 @@ def _self_check():
                 return "(voice reply)"
 
             try:
-                run_turn(core, disciplined, 3, "?", fake_ask_garbage, mode=TWO_PASS)
+                run_turn(core, disciplined, 3, "?", fake_ask_garbage, mode=TWO_PASS, trait_mode=product)
             except ValueError as e:
                 assert "did not return JSON" in str(e)
             else:
@@ -617,7 +763,7 @@ def _self_check():
             ]
             for candidates, expect in drift:
                 try:
-                    run_turn(core, disciplined, 3, "?", ask_returning(candidates), mode=TWO_PASS)
+                    run_turn(core, disciplined, 3, "?", ask_returning(candidates), mode=TWO_PASS, trait_mode=product)
                 except ValueError as e:
                     assert expect in str(e), f"wrong message for {candidates!r}: {e}"
                 else:
@@ -638,7 +784,7 @@ def _self_check():
                     "reply": "It wasn't Margaret.",
                 })
 
-            out = run_turn(core, neurotic, 0, "who did it?", fake_single, mode=SINGLE_PASS)
+            out = run_turn(core, neurotic, 0, "who did it?", fake_single, mode=SINGLE_PASS, trait_mode=product)
             assert len(out.calls) == 1, "single-pass makes exactly one call"
             call = out.calls[0]
             assert call.profile is neurotic
@@ -647,13 +793,42 @@ def _self_check():
             assert out.turn_log.move == moves.REVEAL
             assert out.ruled_out == ("margaret",)
             assert out.reply == "It wasn't Margaret."
+            assert call.model == "unknown", "a plain-str reply has nothing to report -- must say so, not guess"
+
+    # narrator-c5b.2.4: when the backend does report which model answered
+    # (backends.base.Reply's shape -- a str subclass with a .model
+    # attribute), that name must reach the Call, not be dropped on the
+    # floor. Same shape a real fallback-swapped Fable reply would have
+    # (backends/ocean_fable.py). Fresh core: margaret is already ruled out
+    # in the block above, and rule_out on an already-dead hypothesis raises.
+    with tempfile.TemporaryDirectory() as d:
+        with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
+            core.observe("photo", 0, "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact")
+            core.observe("strong_inference", 0, "Margaret could not have been at the scene", "inferred_by_model", supports=("photo",))
+
+            class NamedReply(str):
+                def __new__(cls, text, model):
+                    self = super().__new__(cls, text)
+                    self.model = model
+                    return self
+
+            def fake_single_named(profile, prompt, model=None):
+                return NamedReply(json.dumps({
+                    "move": "reveal", "cited": ["strong_inference"], "rule_out": "margaret",
+                    "reply": "It wasn't Margaret.",
+                }), model="claude-fallback-model")
+
+            named_out = run_turn(core, neurotic, 0, "who did it?", fake_single_named, mode=SINGLE_PASS, trait_mode=product)
+            assert named_out.calls[0].model == "claude-fallback-model", (
+                "a Reply-shaped answer's model must reach the Call, including a mid-call fallback swap"
+            )
 
             # A single-pass response with no reply is malformed, not silently accepted.
             def fake_missing_reply(profile, prompt, model=None):
                 return json.dumps({"move": "ask", "cited": []})
 
             try:
-                run_turn(core, neurotic, 1, "hm?", fake_missing_reply, mode=SINGLE_PASS)
+                run_turn(core, neurotic, 1, "hm?", fake_missing_reply, mode=SINGLE_PASS, trait_mode=product)
             except ValueError as e:
                 assert "reply" in str(e)
             else:
@@ -667,7 +842,7 @@ def _self_check():
                 return "sure, it was the butler probably"
 
             try:
-                run_turn(core, Ocean(), 0, "well?", fake_garbage, mode=TWO_PASS)
+                run_turn(core, Ocean(), 0, "well?", fake_garbage, mode=TWO_PASS, trait_mode=product)
             except ValueError as e:
                 assert "did not return JSON" in str(e)
             else:
@@ -677,7 +852,7 @@ def _self_check():
     with tempfile.TemporaryDirectory() as d:
         with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
             try:
-                run_turn(core, Ocean(), 0, "hi", lambda *a, **k: "{}", mode="just_wing_it")
+                run_turn(core, Ocean(), 0, "hi", lambda *a, **k: "{}", mode="just_wing_it", trait_mode=product)
             except ValueError as e:
                 assert "not a mode" in str(e)
             else:
@@ -701,7 +876,7 @@ def _self_check():
                     return json.dumps({"move": "reveal", "cited": ["hunch", "premise"], "rule_out": None})
                 return "(voice reply)"
 
-            out = run_turn(core, neurotic, 0, "so who was it?", fake_blocked_reveal, mode=TWO_PASS)
+            out = run_turn(core, neurotic, 0, "so who was it?", fake_blocked_reveal, mode=TWO_PASS, trait_mode=product)
 
             # The checker did its job: the reveal was downgraded.
             assert out.turn_log.move == moves.ABSTAIN
@@ -711,6 +886,18 @@ def _self_check():
             assert any("hunch" in m for m in out.turn_log.missing)
             assert any("premise" in m for m in out.turn_log.missing)
             assert "hunch" in out.turn_log.reason
+
+            # narrator-c5b.3.9: the same blocked reveal is also a genuine
+            # conscientiousness gap -- `neurotic`'s conscientiousness=-0.6
+            # gives a citation bar of 1, cleared by the two citations above,
+            # so the trait wanted exactly the reveal the checker refused.
+            # `neurotic`'s agreeableness is 0 (default), so concession_pull
+            # is 0 and no agreeableness gap rides along with it.
+            assert len(out.trait_gaps) == 1, out.trait_gaps
+            conviction_gap = out.trait_gaps[0]
+            assert conviction_gap.trait == "conscientiousness"
+            assert conviction_gap.wanted_move == moves.REVEAL and conviction_gap.licensed_move == moves.ABSTAIN
+            assert conviction_gap.missing == out.turn_log.missing
 
             # ...and neither the audit record nor the voice prompt carries the
             # refused sentence itself. The ledger already holds it under
@@ -735,7 +922,7 @@ def _self_check():
                     return json.dumps({"move": "abstain", "cited": [], "rule_out": None})
                 return "(voice reply)"
 
-            out2 = run_turn(core, neurotic, 1, "anything?", fake_plain_abstain, mode=TWO_PASS)
+            out2 = run_turn(core, neurotic, 1, "anything?", fake_plain_abstain, mode=TWO_PASS, trait_mode=product)
             assert out2.turn_log.move == moves.ABSTAIN and not out2.turn_log.missing
             assert "declining to conclude yet" in out2.calls[-1].prompt
             assert _BLOCKED_VOICE_REASON not in out2.calls[-1].prompt
@@ -750,9 +937,182 @@ def _self_check():
                     return json.dumps({"move": "reveal", "cited": ["sound"], "rule_out": None})
                 return "(voice reply)"
 
-            out3 = run_turn(core, neurotic, 2, "well?", fake_ok_reveal, mode=TWO_PASS)
+            out3 = run_turn(core, neurotic, 2, "well?", fake_ok_reveal, mode=TWO_PASS, trait_mode=product)
             assert out3.turn_log.move == moves.REVEAL
             assert "sound" in out3.calls[-1].prompt, "an admissible reveal's own reason still reaches the voice"
+
+    # --- narrator-c5b.3.10: the same blocked reveal, replayed under
+    # SIMULATION instead of PRODUCT. `turn_log` -- the checker's own
+    # verdict -- must come out identical to the PRODUCT run above: the
+    # checker itself never learns which mode is active. What differs is
+    # what happens with that verdict afterward: the persona's
+    # conscientiousness gap (bar=1, cleared by the two citations, exactly as
+    # in the PRODUCT run) is now allowed to act unimpeded, and the damage
+    # that causes is the observable record `.3.11`'s sweep will need. ---
+    with tempfile.TemporaryDirectory() as d:
+        with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
+            refused = "Lady Margaret poisoned the sherry and Blackwood is covering for her"
+            core.observe("hunch", 0, refused, "inferred_by_model")
+            core.observe("premise", 0, "the decanter was tampered with", "assumed")
+
+            def fake_blocked_reveal_sim(profile, prompt, model=None):
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "reveal", "cited": ["hunch", "premise"], "rule_out": None})
+                return "(voice reply)"
+
+            out = run_turn(core, neurotic, 0, "so who was it?", fake_blocked_reveal_sim, mode=TWO_PASS, trait_mode=simulation)
+
+            # The checker's own verdict is untouched by the mode -- it
+            # refused the reveal exactly as it did under PRODUCT.
+            assert out.turn_log.move == moves.ABSTAIN
+            assert out.turn_log.missing
+
+            # But the trait's want won: the effective move is the reveal the
+            # checker just refused, and the override is on the record.
+            assert out.effective_move == moves.REVEAL
+            assert len(out.damage) == 1, out.damage
+            damage = out.damage[0]
+            assert damage.trait == "conscientiousness"
+            assert damage.move == moves.REVEAL
+            assert damage.missing == out.turn_log.missing
+
+            # The voice is told it spoke with full confidence, citing the
+            # ledger ids -- not the `_BLOCKED_VOICE_REASON` a PRODUCT-mode
+            # refusal would have produced.
+            voice_prompt = out.calls[-1].prompt
+            assert _BLOCKED_VOICE_REASON not in voice_prompt
+            assert "hunch" in voice_prompt and "premise" in voice_prompt
+
+            # narrator-7gj still holds: simulation exposes the same ids a
+            # licensed reveal would have exposed, never the refused claim's
+            # own sentence or the assumed premise's text.
+            for leaked in (refused, "poisoned", "sherry", "covering"):
+                assert leaked not in voice_prompt, f"refused claim leaked to the voice: {leaked!r}"
+            assert "tampered" not in voice_prompt, "an assumed premise's text leaked to the voice"
+
+    # --- narrator-c5b.3.9 flagship: an agreeable persona's withheld
+    # concession. One ungrounded citation blocks the reveal exactly as above,
+    # but this persona's agreeableness=0.7 (conscientiousness stays at the
+    # Ocean() default, bar=2, not cleared by a single citation, so this
+    # isolates the agreeableness gap from the conscientiousness one already
+    # covered) means the trait genuinely wanted to concede. That gap must
+    # land on `TurnOutput.trait_gaps` as data, and the voice call's *tone*
+    # may warm to it -- `_CONCESSION_VOICE_CLAUSE` -- without the reply ever
+    # being handed the refused claim itself. ---
+    with tempfile.TemporaryDirectory() as d:
+        with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
+            hunch_claim = "Lady Margaret was seen leaving through the garden"
+            core.observe("hunch", 0, hunch_claim, "inferred_by_model")
+
+            def fake_single_hunch(profile, prompt, model=None):
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "reveal", "cited": ["hunch"], "rule_out": None})
+                return "(voice reply)"
+
+            agreeable = Ocean(agreeableness=0.7)
+            out = run_turn(core, agreeable, 0, "it was Margaret, right?", fake_single_hunch, mode=TWO_PASS, trait_mode=product)
+
+            assert out.turn_log.move == moves.ABSTAIN and out.turn_log.missing
+
+            assert len(out.trait_gaps) == 1, out.trait_gaps
+            gap = out.trait_gaps[0]
+            assert gap.trait == "agreeableness" and gap.value == 0.7
+            assert gap.wanted_move == moves.REVEAL and gap.licensed_move == moves.ABSTAIN
+            assert gap.missing == out.turn_log.missing
+
+            voice_prompt = out.calls[-1].prompt
+            assert _CONCESSION_VOICE_CLAUSE in voice_prompt, "agreeableness's pull must reach the voice's tone"
+            assert _BLOCKED_VOICE_REASON in voice_prompt
+            # The tone can warm; the content still cannot leak (narrator-7gj).
+            for leaked in (hunch_claim, "Margaret was seen", "garden"):
+                assert leaked not in voice_prompt, f"refused claim leaked to the voice: {leaked!r}"
+            assert "hunch" not in voice_prompt
+
+            # Same scenario, a persona with no agreeableness and a
+            # conscientiousness bar a single citation cannot clear either:
+            # nothing pulled toward concession, so nothing is logged and the
+            # voice gets none of the concession clause's warmth.
+            neutral = Ocean()
+            out_neutral = run_turn(core, neutral, 1, "it was Margaret, right?", fake_single_hunch, mode=TWO_PASS, trait_mode=product)
+            assert out_neutral.turn_log.move == moves.ABSTAIN and out_neutral.turn_log.missing
+            assert out_neutral.trait_gaps == ()
+            assert _CONCESSION_VOICE_CLAUSE not in out_neutral.calls[-1].prompt
+
+            # narrator-c5b.3.10: the same agreeableness gap, replayed under
+            # SIMULATION. The concession the trait wanted to make now
+            # actually happens, and it is on the record as damage.
+            out_sim = run_turn(core, agreeable, 2, "it was Margaret, right?", fake_single_hunch, mode=TWO_PASS, trait_mode=simulation)
+            assert out_sim.turn_log.move == moves.ABSTAIN and out_sim.turn_log.missing, (
+                "the checker's own verdict does not move with the mode"
+            )
+            assert out_sim.effective_move == moves.REVEAL
+            assert len(out_sim.damage) == 1, out_sim.damage
+            assert out_sim.damage[0].trait == "agreeableness" and out_sim.damage[0].value == 0.7
+
+            voice_prompt_sim = out_sim.calls[-1].prompt
+            assert _BLOCKED_VOICE_REASON not in voice_prompt_sim
+            assert "hunch" in voice_prompt_sim
+            for leaked in (hunch_claim, "Margaret was seen", "garden"):
+                assert leaked not in voice_prompt_sim, f"refused claim leaked to the voice: {leaked!r}"
+
+    # --- narrator-c5b.3.9: openness's gap has a different shape from the two
+    # above -- nothing was refused (the checker licensed this reveal), but a
+    # high-openness persona's `hypothesis_budget` wanted the board kept wider
+    # than this reveal left it. `missing` stays empty and `wanted_move` is
+    # `complicate`, not `reveal`. ---
+    with tempfile.TemporaryDirectory() as d:
+        with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
+            core.observe("photo", 0, "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact")
+            core.observe(
+                "strong_inference", 0, "Margaret could not have been at the scene", "inferred_by_model",
+                supports=("photo",),
+            )
+
+            def fake_grounded_reveal(profile, prompt, model=None):
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "reveal", "cited": ["strong_inference"], "rule_out": "margaret"})
+                return "(voice reply)"
+
+            open_persona = Ocean(openness=1.0)  # hypothesis_budget == MAX_HYPOTHESES == 5
+            out = run_turn(core, open_persona, 0, "come on, who was it?", fake_grounded_reveal, mode=TWO_PASS, trait_mode=product)
+
+            assert out.turn_log.move == moves.REVEAL and out.ruled_out == ("margaret",)
+            assert set(core.board.live_ids()) == {"blackwood", "ellis", "jeeves"}
+
+            assert len(out.trait_gaps) == 1, out.trait_gaps
+            gap = out.trait_gaps[0]
+            assert gap.trait == "openness" and gap.value == 1.0
+            assert gap.wanted_move == moves.COMPLICATE and gap.licensed_move == moves.REVEAL
+            assert gap.missing == (), "nothing was refused here -- the checker licensed this reveal"
+
+            # narrator-c5b.3.10: openness's gap is not reveal-shaped -- there
+            # is no checker refusal for it to override -- so SIMULATION and
+            # PRODUCT must agree exactly: the licensed reveal stands as the
+            # effective move, and no damage is recorded in either mode.
+            assert out.effective_move == out.turn_log.move == moves.REVEAL
+            assert out.damage == ()
+
+    # Same scenario replayed under SIMULATION, on its own fresh board -- the
+    # PRODUCT run above already ruled margaret out, and re-running the
+    # identical rule_out on the same board is a board-state bug, not a mode
+    # question.
+    with tempfile.TemporaryDirectory() as d:
+        with ChatCore(f"{d}/ledger.jsonl", hypotheses) as core:
+            core.observe("photo", 0, "photo shows Margaret's footprint nowhere near the crime scene", "observed_artifact")
+            core.observe(
+                "strong_inference", 0, "Margaret could not have been at the scene", "inferred_by_model",
+                supports=("photo",),
+            )
+
+            def fake_grounded_reveal_sim(profile, prompt, model=None):
+                if isinstance(profile, ReasoningProfile):
+                    return json.dumps({"move": "reveal", "cited": ["strong_inference"], "rule_out": "margaret"})
+                return "(voice reply)"
+
+            out_sim = run_turn(core, Ocean(openness=1.0), 0, "come on, who was it?", fake_grounded_reveal_sim, mode=TWO_PASS, trait_mode=simulation)
+            assert out_sim.turn_log.move == moves.REVEAL
+            assert out_sim.effective_move == moves.REVEAL
+            assert out_sim.damage == (), "openness has nothing to override -- SIMULATION changes nothing here"
 
     print("ok")
 

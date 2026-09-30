@@ -87,10 +87,24 @@ not a footnote, so it's recorded here rather than silently overwritten.
 Five-Factor traits as a five-dimensional state vector compiled into model behavior.
 
 - `Ocean` dataclass; five traits as scalars validated to [-1.0, 1.0].
-- Traits past ±0.4 compile into system-prompt injections; both poles are expressible.
-- Traits map to sampling parameters: neuroticism widens temperature, conscientiousness
-  tightens it and raises repeat penalty, openness nudges top_p.
-- `generate()` POSTs to Ollama at `localhost:11434`.
+- Traits past ±0.4 compile into system-prompt injections on both backends; both poles
+  are expressible.
+- Trait → sampler target, per backend (`narrator-c5b.2.3`; `ocean.py`'s `SAMPLER_TARGETS`
+  is the checked copy of this table — the self-check fails if the two ever disagree):
+
+  | trait | Ollama (`backends/ocean_ollama.py`) | Fable (`backends/ocean_fable.py`) |
+  |---|---|---|
+  | openness | `top_p` | none — system prompt only |
+  | conscientiousness | `temperature`, `repeat_penalty` | none — system prompt only |
+  | extraversion | none — system prompt only | none — system prompt only |
+  | agreeableness | none — system prompt only | none — system prompt only |
+  | neuroticism | `temperature` | none — system prompt only |
+
+  `claude-fable-5` 400s on `temperature`/`top_p`/`top_k` outright, so `options()` is
+  never forwarded to it at all — every trait, not just the two Ollama already gives no
+  knob, reaches that backend through the system prompt alone.
+- `generate()` is `backends.ocean_ollama.generate` by default (`backends/base.py`'s
+  `Backend` protocol) — no direct HTTP call lives in `ocean.py` itself.
 
 **Remaining:** JSON schema for profiles + load/save, so profiles are shareable artifacts
 rather than literals in source.

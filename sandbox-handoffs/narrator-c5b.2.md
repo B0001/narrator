@@ -1,100 +1,152 @@
 # narrator-c5b.2 — Model backend split: Ollama stays default, Fable opt-in
 
-## Status: partial, left open on purpose
+## Status: complete, closing this session
 
-The interface is formalised and the Ollama path is migrated behind it. The
-second backend (Fable/Anthropic) is deliberately **not** built this session
-— see "Why this stays open" below. Closing narrator-c5b.2 requires that
-backend to exist ("Both backends satisfy one interface"), so the bead stays
-open until a future session clears its upstream blocker and does that work.
+All five children (`.2.1`–`.2.5`) are closed. The parent's acceptance
+criteria — *"Both backends satisfy one interface; every existing entry point
+runs unchanged against Ollama with no key set."* — now holds: two backends
+(`backends/ocean_ollama.py`, `backends/ocean_fable.py`) satisfy the same
+`Backend` protocol (`backends/base.py`), `ocean.py` still imports its
+default `generate` from the Ollama backend with no key required, and every
+existing caller (`agents.converse`, `motive.prose`, `chapters.write_chapters`,
+`turn.run_turn`) is unchanged at the call site.
 
-## What was built
+## What was built, across the full arc of this bead
 
 - **`backends/base.py`** — `Backend`, a `typing.Protocol`:
-  `generate(profile, prompt, model=...) -> str`. Docstring states the
-  contract callers rely on: personality compiles *inside* the call
-  (`profile.system_prompt()`, `profile.options()`), never before it, so a
-  backend missing an equivalent of one of `options()`'s keys (Anthropic has
-  no `repeat_penalty`) just drops that key — the caller doesn't need to know
-  which backend it's talking to. `conforms()` is a small runtime helper used
-  by self-checks, not an import-time gate. Stdlib only (`typing`).
+  `generate(profile, prompt, model=...) -> str`. Personality compiles
+  *inside* the call (`profile.system_prompt()`, `profile.options()`), never
+  before it, so a backend missing an equivalent of one of `options()`'s keys
+  (Anthropic has no `repeat_penalty`) just drops that key. Also carries
+  **`Reply(str)`** (added for `.2.4`): a `str` subclass with an additive
+  `.model` attribute, so every existing string-consuming caller (`.strip()`,
+  `json.loads()`, equality, f-strings) keeps working unmodified, while a
+  caller that wants to know which model actually answered reads `.model`.
+  `getattr(x, "model", "unknown")` is the shim for code that may see either
+  a `Reply` or a plain `str` (e.g. a self-check stub with nothing to
+  report).
 
-- **`backends/ocean_ollama.py`** — the exact HTTP call that used to live in
-  `ocean.generate()`, moved verbatim (same URL construction, same request
-  body, same `timeout=120`, same default model `qwen2.5-coder:14b` and host
-  `http://localhost:11434`). Self-check monkeypatches `urllib.request.urlopen`
-  so it runs with no live Ollama and asserts the exact request body sent
-  (model, prompt, compiled system prompt, compiled options, `stream: False`)
-  and that the `response` field of the reply is what comes back.
+- **`backends/ocean_ollama.py`** — the original `ocean.generate()` HTTP
+  call, moved verbatim, now wrapping its response in `Reply(text,
+  model=data.get("model", model))` — Ollama's own response names the model
+  that answered; falls back to the requested name only if the server ever
+  omits it.
 
-- **`ocean.py`** — no longer imports `urllib`, no longer contains an HTTP
-  call. `generate` is now `from backends.ocean_ollama import generate`, so
-  every existing caller (`agents.converse`'s `generate_fn` default,
-  `motive.prose`, `chapters.write_chapters`'s default, `ocean.py`'s own
-  `--demo` path) keeps importing `ocean.generate` with the identical
-  signature and identical behaviour. No caller was touched.
+- **`backends/ocean_fable.py`** (`.2.2`) — the second `Backend`
+  implementation: Anthropic `/v1/messages` against `claude-fable-5`. `system`
+  is a top-level request field, not a message role. `max_tokens` has no
+  `options()` equivalent, so this module picks one flat default
+  (`DEFAULT_MAX_TOKENS = 4096`) — documented as a ceiling, not a spend, and
+  generous enough for the longest current caller (`chapters.write_chapters`).
+  The reply is a content-block list, flattened to text. The key comes from
+  `ANTHROPIC_API_KEY` only, never source or a profile file; with no key set
+  this raises naming that variable before any network attempt. Server-side
+  fallbacks are on by default (`anthropic-beta: server-side-fallback-2026-07-01`
+  header, `fallbacks: "default"` body field) — a policy decline gets one
+  retry on a fallback model inside the same call; a refusal that survives
+  the whole chain still raises. Also wraps its return in `Reply(text,
+  model=reply.get("model", model))` — the response's `model` field is
+  whichever model actually answered, which can differ from what was
+  requested when a fallback swap fires. `claude-fable-5` rejects
+  `temperature`/`top_p`/`top_k` outright (HTTP 400), so `profile.options()`
+  is never forwarded on this backend at all — the persona reaches the model
+  through the system prompt only (`.2.3`'s finding, below).
 
-Verified: `python3 backends/base.py`, `python3 backends/ocean_ollama.py`,
-`python3 ocean.py`, `python3 agents.py`, `python3 turn.py`,
-`python3 evidence_ledger.py`, `python3 admissibility.py`, `python3 moves.py`,
-`python3 chat_core.py`, `python3 metrics.py`, `python3 hypothesis_board.py`
-all print `ok` (or, for `metrics.py`, its normal table) unchanged, and
-`uv run pytest` passes. `chapters.py`, `motive.py`, `mystery.py` fail at
-`import networkx` — pre-existing, unrelated to this change, already tracked
-as `narrator-3c5` (networkx missing from `pyproject.toml`).
+- **`ocean.py`** — no `urllib` import, no HTTP call. `generate` is
+  `from backends.ocean_ollama import generate`. `SAMPLER_TARGETS` +
+  `_check_sampler_targets()` document each of the five traits' compilation
+  target *per backend* (`.2.3`): Ollama gets temperature/top_p/top_k/
+  repeat_penalty; Fable gets none of them (forwards no sampler settings —
+  `backends/ocean_fable.py`'s self-check asserts `profile.options()` is
+  never even called, so the "no target" case fails loud rather than
+  silently degrading). `prd.md`'s trait-to-sampler table documents the same
+  mapping for a reader.
 
-`narrator-c5b.2.1` ("Extract a Backend interface behind ocean.generate()")
-was closed as part of this work — its acceptance criteria (`ocean.py` has no
-HTTP call; existing self-checks pass untouched) are exactly what the above
-satisfies, and leaving it open once done would just make a future session
-redo it.
+- **Model-identity discipline (`.2.4`)** — no prompt string built anywhere
+  in the repo names a model (verified by grep, scoped to actual
+  prompt-building functions' returned strings, excluding docstrings/
+  comments/CLI hints). Every persisted transcript record carries the
+  responding model or an explicit `"unknown"`:
+  - `agents.converse()`'s per-turn record gets `"model":
+    getattr(raw, "model", "unknown")`.
+  - `turn.py`'s `Call` dataclass gained a `model: str = "unknown"` field,
+    populated the same way at each of its three `generate_fn` call sites
+    (`reasoning`, `voice`, `ask-candidates`, and the `SINGLE_PASS`
+    `reasoning+voice` call).
+  - `metrics.chat_record()` reads `out.calls[-1].model` — always the call
+    that produced the visible reply (the voice call in `TWO_PASS` even when
+    an ask-candidates call ran first; the single reasoning+voice call in
+    `SINGLE_PASS`).
+  - `chat_session.jsonl`'s fixture was regenerated via
+    `metrics._demo_chat('chat_session.jsonl')` to carry `"model": "unknown"`
+    on every row (its stub `generate()` returns a plain string).
 
-## Why this stays open
+- **Token budget and key policy (`.2.5`, closed by an earlier session,
+  re-verified intact this session)** — `agents.converse()`'s
+  `DEFAULT_TOKEN_BUDGET` / `TokenBudgetExceeded` ceiling on the quadratic
+  transcript cost described in `prd.md`'s cost table, plus the key-policy
+  documentation in `backends/ocean_fable.py`'s module docstring.
 
-The parent bead's acceptance criteria is *"Both backends satisfy one
-interface; every existing entry point runs unchanged against Ollama with no
-key set."* Only one backend exists after this session. The second
-(`narrator-c5b.2.2`, Anthropic `/v1/messages` against `claude-fable-5`) is
-explicitly blocked on `narrator-c5b.1` ("Reverse the 'local Ollama only'
-non-goal, on the record"), and `narrator-c5b.1`'s own acceptance criteria
-says the prd.md amendment must land **before any backend code lands**.
-`prd.md` still lists "No cloud model providers. Local Ollama only." under
-Non-goals (line 22) as of this session. Writing the Fable backend now would
-be exactly the thing that bead exists to gate against — landing code before
-the decision it depends on is on the record. So `narrator-c5b.2.2` (and the
-three P2 children that depend on it in turn — `.2.3` sampler mapping, `.2.4`
-model identity in transcripts, `.2.5` token budget/key policy) were left
-untouched this session.
+Also removed the last Ollama-shaped hardcoded model default
+(`model="llama3"`, `model="qwen2.5-coder:14b"`) from every caller that had
+one — `agents.converse`, `discussion.run_discussion`, `turn.run_turn`,
+`turn._ask_candidate_call`, `question_selector.generate_candidates` — each
+now takes `model=None` and builds `kwargs = {} if model is None else
+{"model": model}`, so the *backend's* `generate()` supplies its own correct
+default only when the caller doesn't override. Which model answers is the
+backend's call, not any caller's.
 
-## Next steps (for whoever picks this up)
+## Verification
 
-1. `narrator-c5b.1` first — amend `prd.md`'s non-goal, record what stays
-   local by default, what the cloud path is for, who holds the key.
-2. `narrator-c5b.2.2` — `backends/ocean_fable.py` implementing the same
-   `Backend` interface built here: `system` as a top-level param (not a
-   message role — `profile.system_prompt()` already produces the right
-   string, it just moves to a different JSON key here), `max_tokens`
-   required (Ollama's call has no equivalent — pick a default and document
-   it), response is a content-block list to flatten rather than a single
-   `response` string, key from `ANTHROPIC_API_KEY` only (never source or a
-   profile file), and a clear `RuntimeError`/similar naming the missing env
-   var when unset — not a raw connection error.
-3. Then `.2.3` (sampler mapping without `repeat_penalty`), `.2.4` (no
-   prompt names a model; transcripts record which model actually answered),
-   `.2.5` (token ceiling for `agents.converse`'s quadratic cost, plus
-   `prd.md` saying which components default to which backend) — all three
-   already depend on `.2.2` in the tracker.
-4. Once `.2.2`–`.2.5` are done, close `narrator-c5b.2` itself — its
-   acceptance criteria will finally be fully met by two backends behind
-   `backends/base.py`'s `Backend` interface.
+Full self-check sweep, all `ok` (or, for `metrics.py`, `ok` plus its normal
+demo table):
 
-## Files touched
+```
+ocean.py, motive.py, chapters.py, question_selector.py, panel.py,
+agents.py, discussion.py, turn.py, metrics.py, chat_core.py,
+evidence_ledger.py, backends/base.py, backends/ocean_ollama.py,
+backends/ocean_fable.py
+```
 
-- `backends/__init__.py` (new)
-- `backends/base.py` (new)
-- `backends/ocean_ollama.py` (new)
-- `ocean.py` (HTTP call removed, `generate` now imported from
-  `backends.ocean_ollama`)
+`uv run pytest -q` from `/workspace` → `1 passed`.
 
-No commits made — repo policy is not to commit/push unless the bead says to,
-and this bead doesn't.
+`turn.py`'s self-check specifically proves the `Reply`/`.model` propagation
+end to end: a `NamedReply` (same shape as `backends.base.Reply`) fed through
+`run_turn()` in `SINGLE_PASS` mode against a *fresh* `ChatCore` (a hypothesis
+already ruled out by a preceding scenario in the same self-check can't be
+ruled out twice — `hypothesis_board.rule_out()` raises `KeyError` on a
+non-live hypothesis; the fix this session was giving that scenario its own
+`ChatCore` rather than reusing one already past that state) shows up as
+`named_out.calls[0].model == "claude-fallback-model"`, proving a mid-call
+fallback swap on Fable would reach the transcript, not just the "unknown"
+degrade path a plain-str stub exercises.
+
+## Children (all closed)
+
+- `narrator-c5b.2.1` — Backend interface extracted behind `ocean.generate()`.
+- `narrator-c5b.2.2` — `backends/ocean_fable.py` against `claude-fable-5`.
+- `narrator-c5b.2.3` — sampler mapping re-derived per backend, no
+  `repeat_penalty` pretending on Fable.
+- `narrator-c5b.2.4` — no prompt names a model; transcripts record who
+  answered or say `unknown`.
+- `narrator-c5b.2.5` — token budget ceiling + key policy.
+
+## Files touched (this session's increment on top of prior sessions)
+
+- `backends/base.py` — added `Reply(str)`.
+- `backends/ocean_ollama.py`, `backends/ocean_fable.py` — wrapped return
+  values in `Reply`; added the try/relative-then-absolute import fallback
+  for `Reply` (needed because `backends/` is a real package — `from .base
+  import Reply` works when imported as `backends.ocean_ollama`, but running
+  `python ocean_ollama.py` directly has no parent package context, so it
+  falls back to `from base import Reply`).
+- `agents.py`, `discussion.py`, `turn.py`, `question_selector.py` —
+  `model="<hardcoded>"` → `model=None` plus the `kwargs = {} if model is
+  None else {"model": model}` pattern at each call site.
+- `metrics.py` — `chat_record()` gained a `"model"` field;
+  `chat_session.jsonl` regenerated.
+- Self-checks extended in all of the above to assert the new behavior, not
+  just implement it.
+
+No commits made — repo policy (CLAUDE.md, conservative profile) is not to
+commit/push without explicit authority. `git status` at session end below.

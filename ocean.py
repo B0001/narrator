@@ -29,6 +29,37 @@ DESCRIPTORS = {
 THRESHOLD = 0.4
 IDENTITY = [[1.0 if i == j else 0.0 for j in range(5)] for i in range(5)]
 
+# Where each trait actually lands, per backend (narrator-c5b.2.3). Every
+# trait compiles into system_prompt() on both backends unconditionally --
+# this table is only about the second path, options().
+#
+# Ollama (backends/ocean_ollama.py) forwards options() as-is, so a trait
+# either drives a real sampler knob there or it doesn't:
+#   openness           -> top_p
+#   conscientiousness   -> temperature, repeat_penalty
+#   neuroticism         -> temperature
+#   extraversion        -> no sampler target (system prompt only)
+#   agreeableness       -> no sampler target (system prompt only)
+#
+# claude-fable-5 (backends/ocean_fable.py) 400s on temperature/top_p/top_k --
+# the model removed sampler controls outright -- so options() is never
+# forwarded there at all. Every trait, including the three Ollama gives a
+# real knob, reaches Fable through system_prompt() only:
+#   openness, conscientiousness, extraversion, agreeableness, neuroticism
+#                       -> no sampler target on this backend
+#
+# _check_sampler_targets() (below) proves the Ollama column against the
+# actual options() output, so this table cannot drift from what the code
+# does without a test failing -- "say so instead of pretending" means the
+# documentation is checked, not just written down.
+SAMPLER_TARGETS = {
+    "openness": ("top_p",),
+    "conscientiousness": ("temperature", "repeat_penalty"),
+    "extraversion": (),
+    "agreeableness": (),
+    "neuroticism": ("temperature",),
+}
+
 
 @dataclass
 class Ocean:
@@ -103,7 +134,15 @@ class Ocean:
         return "Adopt this personality in every response:\n" + "\n".join(lines)
 
     def options(self):
-        """Neuroticism widens sampling; conscientiousness tightens it."""
+        """Neuroticism widens sampling; conscientiousness tightens it.
+
+        This is the Ollama-shaped compilation target -- see SAMPLER_TARGETS
+        for which trait drives which key, and which traits (extraversion,
+        agreeableness) have none and reach the model through system_prompt()
+        only. backends/ocean_fable.py drops this dict wholesale: claude-fable-5
+        rejects every key here, so on that backend every trait, not just
+        those two, compiles through system_prompt() alone.
+        """
         temperature = 0.7 + 0.4 * self.neuroticism - 0.3 * self.conscientiousness
         return {
             "temperature": round(max(0.1, min(1.5, temperature)), 3),
@@ -190,7 +229,39 @@ def _self_check():
 
     _check_profile_io()
     _check_matrix_gate()
+    _check_sampler_targets()
     print("ok")
+
+
+def _check_sampler_targets():
+    """SAMPLER_TARGETS documents which trait drives which options() key on
+    Ollama, and which traits drive none. Prove it against the real output
+    rather than trusting the comment: for every trait, perturbing it alone
+    must change exactly the options() keys the table says it does, and leave
+    every other key untouched.
+
+    narrator-c5b.2.3: "say so instead of pretending" means this has to be
+    something that fails if options() and the table ever disagree, not a
+    docstring anyone could edit independently of the code.
+    """
+    baseline = Ocean().options()
+    for trait, targets in SAMPLER_TARGETS.items():
+        perturbed = Ocean(**{trait: 0.9}).options()
+        changed = {k for k in baseline if perturbed[k] != baseline[k]}
+        assert changed == set(targets), (
+            f"{trait}: SAMPLER_TARGETS says {targets}, options() actually changed {sorted(changed)}"
+        )
+
+    # claude-fable-5 rejects every options() key outright (backends/
+    # ocean_fable.py), so the Ollama-shaped dict above is never forwarded --
+    # every trait's sampler target on that backend is "none", not just the
+    # two Ollama already gives no knob. This is a structural fact about that
+    # backend, checked directly by ocean_fable.py's own self-check (it never
+    # calls profile.options() at all); asserted here too so the claim in
+    # this module's docstring can't drift from the SAMPLER_TARGETS table
+    # without a second, independent failure.
+    all_traits = set(TRAITS)
+    assert set(SAMPLER_TARGETS) == all_traits, "SAMPLER_TARGETS must document every trait, not a subset"
 
 
 def _check_matrix_gate():

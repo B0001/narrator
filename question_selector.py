@@ -78,6 +78,23 @@ class SelectionLog:
     chosen: str  # candidate id, or None if nothing on the table splits the board
 
 
+def question_id(selection_log):
+    """The id `evidence_ledger.write`'s `prompted_by` should carry for
+    evidence elicited by this turn's chosen question (narrator-5ob).
+
+    A bare candidate id (`SelectionLog.chosen`) is only unique within the one
+    generation call that produced it -- nothing stops turn 4's candidates
+    from reusing turn 0's id `"whereabouts"`. Prefixing with the turn number
+    is enough to make it unique across a whole conversation without a new
+    id-allocation scheme: `SelectionLog.turn` is already the turn the
+    question was asked on, and there is at most one chosen question per
+    turn.
+    """
+    if selection_log.chosen is None:
+        raise ValueError(f"turn {selection_log.turn} chose no question; there is no id to stamp evidence with")
+    return f"{selection_log.turn}:{selection_log.chosen}"
+
+
 def _live_weights(board):
     return {h["id"]: h["weight"] for h in board.dump()["hypotheses"] if h["live"]}
 
@@ -282,7 +299,7 @@ def parse_candidates(board, raw):
     return tuple(candidates)
 
 
-def generate_candidates(board, profile, generate_fn, model="qwen2.5-coder:14b", n=3):
+def generate_candidates(board, profile, generate_fn, model=None, n=3):
     """One model call, over `candidate_prompt(board, n)` alone, producing
     scoreable candidates. `generate_fn` follows the repo-wide injectable
     shape (`profile, prompt, model=...`), same as `ocean.generate` /
@@ -290,8 +307,12 @@ def generate_candidates(board, profile, generate_fn, model="qwen2.5-coder:14b", 
     persona-neutral one (`turn.REASONING_PROFILE`) the same way the
     reasoning channel itself is pinned, and a self-check can swap in a
     scripted stub with no model at all.
+
+    model=None (narrator-c5b.2.4): no Ollama-shaped default here either --
+    which model answers is the backend's call, not this function's.
     """
-    raw = generate_fn(profile, candidate_prompt(board, n=n), model=model)
+    kwargs = {} if model is None else {"model": model}
+    raw = generate_fn(profile, candidate_prompt(board, n=n), **kwargs)
     return parse_candidates(board, raw)
 
 
@@ -326,6 +347,19 @@ def _self_check():
 
     log = select_question(board, 0, [boring, full_split, one_off])
     assert log.chosen == "whereabouts", log.chosen
+
+    # narrator-5ob: the id prompted_by should carry is turn-prefixed, since a
+    # bare candidate id is only unique within its own generation call.
+    assert question_id(log) == "0:whereabouts"
+    later_log = SelectionLog(4, (), "whereabouts")
+    assert question_id(later_log) == "4:whereabouts", "same candidate id, different turn, different question id"
+    declined_log = SelectionLog(2, (), None)
+    try:
+        question_id(declined_log)
+    except ValueError as e:
+        assert "chose no question" in str(e)
+    else:
+        raise AssertionError("a turn that chose no question has no id to build")
 
     by_id = {s.id: s for s in log.scored}
     assert by_id["breakfast"].discriminates is False

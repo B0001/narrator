@@ -11,6 +11,11 @@ possible to add without editing a single caller.
 import json
 import urllib.request
 
+try:
+    from .base import Reply  # imported as backends.ocean_ollama (e.g. from ocean.py)
+except ImportError:
+    from base import Reply  # run directly: `python ocean_ollama.py`, backends/ is on sys.path
+
 
 def generate(profile, prompt, model="qwen2.5-coder:14b", host="http://localhost:11434"):
     body = json.dumps({
@@ -22,7 +27,11 @@ def generate(profile, prompt, model="qwen2.5-coder:14b", host="http://localhost:
     }).encode()
     req = urllib.request.Request(f"{host}/api/generate", body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:
-        return json.load(r)["response"]
+        data = json.load(r)
+    # Ollama's own response names the model that actually answered; fall back
+    # to the requested name only if the server ever omits it (narrator-c5b.2.4
+    # -- a caller must be able to record which model answered, not assume it).
+    return Reply(data["response"], model=data.get("model", model))
 
 
 def _self_check():
@@ -72,6 +81,35 @@ def _self_check():
         "options": {"temperature": 0.5, "top_p": 0.9, "repeat_penalty": 1.1},
         "stream": False,
     }, "request body must carry the compiled profile, not the profile object itself"
+
+    # narrator-c5b.2.4: the reply names the model that actually answered.
+    assert isinstance(result, Reply), "generate() must return a Reply, not a plain str"
+    assert result.model == "test-model", "Ollama's response 'model' field is what answered"
+
+    # If a server response ever omits "model", fall back to what was
+    # requested rather than crashing or guessing something else.
+    urllib.request.urlopen = fake_urlopen
+    captured.clear()
+
+    class FakeResponseNoModel:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"response": "other text"}).encode()
+
+    def fake_urlopen_no_model(req, timeout=None):
+        return FakeResponseNoModel()
+
+    urllib.request.urlopen = fake_urlopen_no_model
+    try:
+        result2 = generate(FakeProfile(), "a prompt", model="fallback-model")
+    finally:
+        urllib.request.urlopen = real_urlopen
+    assert result2.model == "fallback-model", "with no 'model' in the response, fall back to what was requested"
 
     print("ok")
 
