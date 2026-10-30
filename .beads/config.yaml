@@ -67,3 +67,5 @@
 
 sync:
     remote: "git+https://github.com/B0001/narrator.git"
+export:
+    auto: true
