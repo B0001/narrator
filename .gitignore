@@ -4,6 +4,7 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads.gate.lock
 
 # Scratch transcripts from ad-hoc runs (scenario samples are committed by name)
 transcript.jsonl
